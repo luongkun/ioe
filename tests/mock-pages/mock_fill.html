@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Mock Fill Missing Letters - IOE Test</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #eef2f6; margin: 0; padding: 30px; user-select: none; }
+    .exam-container { max-width: 800px; margin: 0 auto; background: #fff; border-radius: 12px; padding: 30px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); }
+    .question-content { font-size: 16px; font-weight: 600; color: #0f172a; margin-bottom: 15px; line-height: 1.5; }
+    .input-answer-box { display: flex; gap: 10px; }
+    .input-answer { flex: 1; padding: 10px 14px; border: 2px solid #cbd5e1; border-radius: 8px; font-size: 16px; font-weight: 600; outline: none; }
+  </style>
+</head>
+<body oncontextmenu="return false;" onselectstart="return false;">
+  <div class="exam-container">
+    <div class="question-content" id="txtQuestion">Câu 2: My sister wants to become a fam_ _s singer in the future.</div>
+    <div class="input-answer-box">
+      <input type="text" id="txtAnswer" class="input-answer" placeholder="Nhập chữ cái còn thiếu...">
+      <button class="btn-submit" onclick="alert('Đã nộp: ' + document.getElementById('txtAnswer').value)">Nộp bài</button>
+    </div>
+  </div>
+</body>
+</html>

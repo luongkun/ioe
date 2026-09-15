@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Mock Reorder Words - IOE Test</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #eef2f6; margin: 0; padding: 30px; user-select: none; }
+    .exam-container { max-width: 800px; margin: 0 auto; background: #fff; border-radius: 12px; padding: 30px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); }
+    .question-content { font-size: 16px; font-weight: 600; color: #0f172a; margin-bottom: 15px; line-height: 1.5; }
+    .drag-box { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px; }
+    .item-reorder { background: #e0e7ff; color: #3730a3; padding: 6px 12px; border-radius: 6px; font-weight: 600; border: 1px solid #c7d2fe; }
+    .input-answer-box { display: flex; gap: 10px; }
+    .input-answer { flex: 1; padding: 10px 14px; border: 2px solid #cbd5e1; border-radius: 8px; font-size: 16px; font-weight: 600; outline: none; }
+  </style>
+</head>
+<body oncontextmenu="return false;" onselectstart="return false;">
+  <div class="exam-container">
+    <div class="question-content" id="txtQuestion">Câu 3: Sắp xếp các từ sau thành câu đúng:</div>
+    <div class="drag-box">
+      <span class="item-reorder">always</span>
+      <span class="item-reorder">She</span>
+      <span class="item-reorder">in</span>
+      <span class="item-reorder">gets up</span>
+      <span class="item-reorder">the morning</span>
+      <span class="item-reorder">early</span>
+    </div>
+    <div class="input-answer-box">
+      <input type="text" class="input-answer" placeholder="Câu hoàn chỉnh...">
+      <button class="btn-submit">Nộp bài</button>
+    </div>
+  </div>
+</body>
+</html>

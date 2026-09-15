@@ -5,18 +5,19 @@
 
 const DEFAULT_CONFIG = {
   geminiApiKey: "YOUR_API_KEY_HERE",
-  model: "gemini-3.7-flash",
+  model: "gemini-2.5-flash",
   autoShowToolbar: true,
   targetLanguage: "vi"
 };
 
+// Real, publicly available Gemini model IDs (aliases first — they track the
+// current generation without breaking when versions rotate).
 const FALLBACK_MODELS = [
-  "gemini-3.1-flash-lite",
-  "gemini-3.5-flash",
-  "gemini-3.8-flash",
-  "gemini-3.6-flash",
-  "gemini-3.7-flash",
   "gemini-flash-latest",
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.5-pro",
   "gemini-pro-latest"
 ];
 
@@ -56,6 +57,19 @@ CÁC DẠNG BÀI THI IOE VÀ QUY TẮC ĐỊNH DẠNG DÒNG ĐẦU TIÊN:
 - TUYỆT ĐỐI KHÔNG BỎ SÓT: đếm tổng số câu trong đề (ví dụ 10) thì phải trả về ĐỦ 10 kết quả. Nếu một câu không có file audio hoặc nghe không rõ, VẪN PHẢI đoán True/False dựa trên câu khẳng định (câu khẳng định thường đúng → True), KHÔNG ĐƯỢC bỏ câu đó.
 - Dòng đầu tiên BẮT BUỘC:
 [TF_ANSWERS: 1. True, 2. False, 3. True, ...] (liệt kê ĐỦ TẤT CẢ các câu theo đúng thứ tự, không bỏ sót câu nào, số câu phải bằng đúng tổng số câu trong đề)
+
+6. DẠNG 6: BÀI NGHE ĐIỀN TỪ (Listen & fill in the blank — câu bị che dấu *** )
+- Mỗi câu có 1 file audio [AUDIO CÂU N] và 1 câu tiếng Anh có TỪ BỊ CHE bằng dấu * (số dấu * = số chữ cái bị che, có thể có tiền tố như "sup*****" = sup + 5 chữ cái).
+- Nghe TỪNG file audio, xác định chính xác TỪ BỊ CHE và viết lại ĐÚNG DẠNG ngữ pháp (chia động từ, danh từ số nhiều, so sánh hơn...). Ví dụ "sup*****" → "supposed" (8 chữ cái, bắt đầu bằng "sup").
+- Nếu đề có KHO TỪ GỢI Ý, ưu tiên từ khớp cả NGHĨA lẫn ĐỘ DÀI (số chữ cái); nếu không từ nào khớp thì dùng từ nghe được từ audio.
+- TUYỆT ĐỐI KHÔNG BỎ SÓT câu nào: trả về ĐỦ theo đúng số câu trong đề.
+- Dòng đầu tiên BẮT BUỘC:
+[FILL_WORDS: 1. từ_câu_1, 2. từ_câu_2, ...] (mỗi câu ĐÚNG 1 từ, viết thường không dấu cách)
+
+7. DẠNG 7: BÀI TRẮC NGHIỆM NHIỀU CÂU (đề liệt kê sẵn từng câu với các lựa chọn A/B/C/D)
+- Với MỖI câu chọn đúng 1 lựa chọn.
+- Dòng đầu tiên BẮT BUỘC:
+[MCQ_ANSWERS: 1. B, 2. A, 3. D, ...] (liệt kê ĐỦ tất cả các câu theo đúng thứ tự)
 
 Trình bày ngắn gọn, súc tích, dịch nghĩa và giải thích rõ ràng.`,
 
@@ -177,7 +191,7 @@ async function callSingleModel(modelName, apiKey, promptText, imageBase64 = null
   return candidate.content.parts[0].text;
 }
 
-async function callGeminiWithFallback(text, taskType, customApiKey, customModel, imageBase64 = null, audioObj = null, customHint = "", audioList = null) {
+async function callGeminiWithFallback(text, taskType, customApiKey, customModel, imageBase64 = null, audioObj = null, customHint = "", audioList = null, examKind = null) {
   const config = await chrome.storage.local.get(DEFAULT_CONFIG);
   const apiKey = customApiKey || config.geminiApiKey || DEFAULT_CONFIG.geminiApiKey;
   const primaryModel = customModel || config.model || DEFAULT_CONFIG.model;
@@ -197,8 +211,19 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
     fullPrompt += "\n\n[CHÚ Ý: BÀI THI NGHE AUDIO. Hãy nghe file âm thanh đính kèm kết hợp hình ảnh màn hình!]";
   }
 
+  // examKind-aware multi-audio instruction: a listening exam is NOT always
+  // True/False — fill-word listening exams must return [FILL_WORDS], not
+  // [TF_ANSWERS]. This was the root cause of the "Tái tạo san hô" misclassification.
   if (Array.isArray(audioList) && audioList.length > 0) {
-    fullPrompt += `\n\n[CHÚ Ý: BÀI THI NGHE TRUE/FALSE GỒM ${audioList.length} CÂU. Có ${audioList.length} file audio đính kèm theo đúng thứ tự câu (AUDIO CÂU 1, AUDIO CÂU 2, ...). Hãy nghe TỪNG file, đối chiếu với câu khẳng định của câu tương ứng và trả về ĐỦ ${audioList.length} kết quả theo định dạng [TF_ANSWERS: 1. True, 2. False, ...]!]`;
+    if (examKind === "fillword") {
+      fullPrompt += `\n\n[CHÚ Ý: BÀI THI NGHE ĐIỀN TỪ GỒM ${audioList.length} CÂU. Có ${audioList.length} file audio đính kèm theo đúng thứ tự câu (AUDIO CÂU 1, AUDIO CÂU 2, ...). Hãy nghe TỪNG file, tìm TỪ BỊ CHE (dấu ***) trong câu khẳng định tương ứng và trả về ĐỦ ${audioList.length} kết quả theo định dạng [FILL_WORDS: 1. từ_1, 2. từ_2, ...] — mỗi câu ĐÚNG 1 từ!]`;
+    } else {
+      fullPrompt += `\n\n[CHÚ Ý: BÀI THI NGHE TRUE/FALSE GỒM ${audioList.length} CÂU. Có ${audioList.length} file audio đính kèm theo đúng thứ tự câu (AUDIO CÂU 1, AUDIO CÂU 2, ...). Hãy nghe TỪNG file, đối chiếu với câu khẳng định của câu tương ứng và trả về ĐỦ ${audioList.length} kết quả theo định dạng [TF_ANSWERS: 1. True, 2. False, ...]!]`;
+    }
+  }
+
+  if (examKind === "mcq_multi") {
+    fullPrompt += "\n\n[CHÚ Ý: BÀI TRẮC NGHIỆM NHIỀU CÂU. Hãy giải TỪNG câu trong đề và trả về dòng đầu tiên theo định dạng [MCQ_ANSWERS: 1. B, 2. A, ...] với ĐỦ mọi câu!]";
   }
 
   if (text) {
@@ -313,7 +338,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           });
         }
 
-        const result = await callGeminiWithFallback(request.text || "", "ioe_auto", request.apiKey, request.model, imagePayload, audioObj, request.hint, audioList);
+        const result = await callGeminiWithFallback(request.text || "", "ioe_auto", request.apiKey, request.model, imagePayload, audioObj, request.hint, audioList, request.examKind);
         sendResponse({ success: true, data: result, hasAudio: !!(audioObj || (audioList && audioList.length)) });
       } catch (err) {
         sendResponse({ success: false, error: err.message });

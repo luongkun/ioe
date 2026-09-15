@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Mock Nghe Điền Từ (Cocos EditBox) - IOE Test</title>
+  <style>
+    body { margin: 0; background: #0b1220; font-family: 'Segoe UI', Tahoma, sans-serif; }
+    #GameCanvas { display: block; width: 900px; height: 560px; background: #12325e; margin: 40px auto; border-radius: 12px; }
+    #mock-log { color: #94a3b8; font-size: 12px; max-width: 900px; margin: 0 auto 20px; }
+  </style>
+</head>
+<body oncontextmenu="return false;" onselectstart="return false;">
+  <canvas id="GameCanvas" width="900" height="560"></canvas>
+  <div id="mock-log">Mock game: 5 câu nghe điền từ (EditBox Cocos giả lập). Trạng thái: <span id="mock-state">chưa bắt đầu</span></div>
+  <script>
+    setInterval(() => {
+      const el = document.getElementById("mock-state");
+      if (!el) return;
+      const st = window.MOCK_GAME_STATE || {};
+      el.textContent = st.finished ? "HOÀN THÀNH — " + JSON.stringify(st.submitted)
+        : `started=${!!st.started} current=${st.current} typed=${(st.typedEvents || []).join("|")}`;
+    }, 400);
+  </script>
+  <script src="mock_cocos_runtime.js"></script>
+  <script>
+    window.MOCK_GAME.init({
+      type: "fillword",
+      questions: [
+        { prompt: "He's not sup***** to eat anything else right now.", audio: "http://127.0.0.1:8920/a1.mp3" },
+        { prompt: "We will be using the ******** lab every other week on Thursday.", audio: "http://127.0.0.1:8920/a2.mp3" },
+        { prompt: "My grandparents' ***** on marriage are still very traditional.", audio: "http://127.0.0.1:8920/a3.mp3" },
+        { prompt: "This class ***** on Tuesdays and Thursdays from 3:15 to 4:50.", audio: "http://127.0.0.1:8920/a4.mp3" },
+        { prompt: "The team carried out important ******** on climate change.", audio: "http://127.0.0.1:8920/a5.mp3" }
+      ]
+    });
+  </script>
+</body>
+</html>

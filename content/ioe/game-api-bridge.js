@@ -39,9 +39,24 @@
     return (s == null ? "" : String(s)).replace(/\s+/g, " ").trim();
   }
 
+  // Detect masked words in a prompt: "sup***** to eat" → { masked: true, stars: 5 }
+  // The star count encodes the number of hidden characters — a strong hint for AI.
+  function maskInfo(text) {
+    const m = String(text || "").match(/(\w*)\*{3,}/);
+    if (m) return { masked: true, prefix: m[1] || "", stars: m[0].replace(/^\w*/, "").length };
+    const u = String(text || "").match(/_{3,}/);
+    if (u) return { masked: true, prefix: "", stars: u[0].length };
+    return { masked: false, prefix: "", stars: 0 };
+  }
+
   function normalizeGetInfo(json) {
     const g = json && json.data && json.data.game;
-    if (!g) return null;
+    if (!g) {
+      // Token single-use / hết hạn: API trả lỗi quyền truy cập → báo cho user
+      // biết phải tải lại trang thay vì đứng im không có gì (BUG#8).
+      const errMsg = (json && (json.message || (json.data && json.data.message))) || "";
+      return { error: true, message: String(errMsg) };
+    }
     const qs = Array.isArray(g.question) ? g.question : [];
     const questions = qs.map((q, idx) => {
       const desc = q.Description || {};
@@ -57,6 +72,7 @@
       const tans = (Array.isArray(q.tans) ? q.tans : [])
         .map(a => clean(a && (a.content || a.ans || a))).filter(Boolean);
 
+      const mask = maskInfo(prompt || descContent);
       return {
         index: idx + 1,
         id: q.id,
@@ -67,6 +83,9 @@
         audio,
         answers,
         tans,
+        masked: mask.masked,
+        maskPrefix: mask.prefix,
+        maskStars: mask.stars,
         isListening: !!audio
       };
     });
@@ -112,7 +131,11 @@
     try { json = JSON.parse(text); } catch (e) { return; }
 
     if (/\/getinfo/i.test(url)) {
-      if (normalizeGetInfo(json)) {
+      const norm = normalizeGetInfo(json);
+      if (norm && norm.error) {
+        console.warn("[IOE Bridge] getinfo lỗi: " + norm.message);
+        emit("GETINFO_ERROR", { message: norm.message });
+      } else if (norm) {
         console.log("%c[IOE Bridge] getinfo captured — " + state.questions.length + " questions", "color:#10b981;font-weight:bold");
         emit("GETINFO");
       }
@@ -246,12 +269,17 @@
     } catch (e) { return false; }
   }
 
+  // Click a Cocos node THE RELIABLE WAY — validated live on ioe.vn games:
+  // 1) DOM MouseEvents at the node's screen position: the real Cocos canvas
+  //    listens to them (matching-pair clicks scored 40/60 in a live round).
+  // 2) Engine-level emit("click") only as a fallback when no canvas/position
+  //    is available — avoids double-firing handlers on nodes that listen both ways.
   function clickNode(node) {
     if (!node) return false;
     const world = nodeWorld(node);
     const pt = designToClient(world);
-    if (!pt.ok) return false;
-    return domClickAt(pt.x, pt.y);
+    if (pt.ok) return domClickAt(pt.x, pt.y);
+    try { node.emit("click"); return true; } catch (e) { return false; }
   }
 
   function labelOf(node) {
@@ -345,36 +373,95 @@
     return null;
   }
 
-  function startGame() {
+  // ALL nodes matching a text (duplicates happen: a Q-card and an A-card can
+  // carry the SAME text, e.g. "How do you do?" ↔ "How do you do?").
+  function findAllNodesByText(text) {
+    const target = normText(text);
+    if (!target) return [];
+    const cands = allNodes().filter(n => n && n.activeInHierarchy !== false);
+    const exactButtons = [], exactAny = [], containsAny = [];
+    for (const n of cands) {
+      const t = normText(nodeText(n));
+      if (!t) continue;
+      if (t === target) (isButton(n) ? exactButtons : exactAny).push(n);
+      else if (target.length >= 3 && (t.includes(target) || target.includes(t))) containsAny.push(n);
+    }
+    const out = exactButtons.concat(exactAny);
+    if (!out.length) return containsAny;
+    return out;
+  }
+
+  async function startGame() {
     let closed = 0, started = 0;
-    // 1. Close intro/warning popups (emit only — never DOM-click, popup is not a gameplay node)
-    const closedNames = ["btn_close", "btnClose"];
+    // 1. Close intro/warning popups — the real games show a system-requirements
+    //    dialog whose button is named btnOK (plus btn_close variants).
+    const closedNames = ["btn_close", "btnClose", "btnOK", "ok_btn", "btn_ok", "btnOkay"];
     for (const nm of closedNames) {
       const n = findNodeByName(nm);
       if (n) { try { n.emit("click"); closed++; } catch (e) {} }
     }
+    // Also close any active button whose label is exactly "OK"
+    const okLabel = findNodeByText("ok", { contains: false });
+    if (okLabel && isButton(okLabel)) { try { okLabel.emit("click"); closed++; } catch (e) {} }
+    // Give the scene a beat to settle after closing the popup BEFORE pressing
+    // start — pressing both in the same tick loses the start press (the scene
+    // is still switching) and the round dies instantly with "Total Time 00:00".
+    await sleep(700);
     // 2. Start the game — ONLY the real start button (emit only).
     //    NEVER touch GAME_PLAY / play / start: those are full-screen containers whose
     //    center overlaps an answer card → would select an option before solving!
     const n = findNodeByName("start_btn");
     if (n) { try { n.emit("click"); started++; } catch (e) {} }
-    return { closed, started, scene: (getCC() && getCC().director ? (getCC().director.getScene() || {}).name : null) };
+    // 3. The Windows-10 upgrade notice pops up a beat AFTER the start press —
+    //    dismiss it right away or it swallows the first question's inputs.
+    await sleep(1500);
+    const dismissed = dismissSystemPopups();
+    return { closed, started, dismissed, scene: (getCC() && getCC().director ? (getCC().director.getScene() || {}).name : null) };
   }
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // Wait for a node (by text) to actually appear & be clickable — the real
+  // games take ~1-2s to make the cards interactive after the start animation.
+  async function waitForNodeByText(text, timeoutMs = 8000, excludeNode = null) {
+    const t0 = Date.now();
+    let node = pickTextNode(text, excludeNode);
+    while (!node && Date.now() - t0 < timeoutMs) {
+      await sleep(300);
+      node = pickTextNode(text, excludeNode);
+    }
+    return node;
+  }
+
+  // Find a text node, preferring one DIFFERENT from excludeNode (duplicate-text
+  // cards: clicking the same card twice toggles it off and the pair never matches).
+  function pickTextNode(text, excludeNode) {
+    const all = findAllNodesByText(text);
+    if (!all.length) return null;
+    if (excludeNode && all.length > 1) {
+      const other = all.find(n => n !== excludeNode);
+      if (other) return other;
+    }
+    return all[0];
+  }
 
   async function autoMatch(pairs, runId) {
     let done = 0, failed = 0;
     for (let i = 0; i < pairs.length; i++) {
       const a = pairs[i][0], b = pairs[i][1];
-      const na = findNodeByText(a, { contains: true });
+      // Wait for EACH card to be live before clicking — clicking a card that is
+      // still animating in is a silent no-op and derails the whole round
+      // (observed live: "Wrong attempt" cascade → score 0).
+      const na = await waitForNodeByText(a, 6000);
       if (na) { clickNode(na); done++; }
-      await sleep(getRandom(350, 550));
-      const nb = findNodeByText(b, { contains: true });
+      await sleep(getRandom(180, 320));
+      // Pass na as the exclusion: when two cards share the same text (Q/A echo
+      // pairs like "How do you do?"), the second click must land on the OTHER card.
+      const nb = await waitForNodeByText(b, 4000, na || undefined);
       if (nb) { clickNode(nb); done++; }
       else failed++;
-      await sleep(getRandom(750, 1050));
-      window.postMessage({ __ioeBridge: true, type: "MATCH_PROGRESS", payload: { runId, pair: pairs[i], index: i, total: pairs.length } }, window.location.origin);
+      await sleep(getRandom(300, 500));
+      window.postMessage({ __ioeBridge: true, type: "MATCH_PROGRESS", payload: { runId, pair: pairs[i], index: i, total: pairs.length, okA: !!na, okB: !!nb } }, window.location.origin);
     }
     window.postMessage({ __ioeBridge: true, type: "MATCH_DONE", payload: { runId, done, failed, total: pairs.length } }, window.location.origin);
     return { done, failed };
@@ -421,6 +508,271 @@
       out.push({ name: n.name, text: nodeText(n) });
     }
     return out;
+  }
+
+  // ---------- EditBox typing (BUG#2: listening fill-word games need TYPING, not clicking) ----------
+  // Cocos Creator EditBox: set `.string` programmatically + sync the hidden DOM
+  // input Cocos creates on web, then fire the component's text-changed event so
+  // gameplay code that listens for edits stays consistent.
+  function findEditBoxes() {
+    const cc = getCC();
+    const out = [];
+    if (!cc || !cc.EditBox) return out;
+    for (const n of allNodes()) {
+      if (!n || n.activeInHierarchy === false) continue;
+      try {
+        const eb = n.getComponent && n.getComponent(cc.EditBox);
+        if (eb) out.push({ node: n, name: n.name, editBox: eb, string: eb.string || "" });
+      } catch (e) {}
+    }
+    return out;
+  }
+
+  function syncCocosDomInputs(text) {
+    // Cocos web builds park one hidden <input>/<textarea> per focused EditBox
+    // (usually inside the canvas container). Setting their value + firing input
+    // events keeps the engine-side and DOM-side state in sync.
+    let touched = 0;
+    const cv = getCanvas();
+    const root = cv ? (cv.parentElement || document.body) : document.body;
+    const domInputs = root.querySelectorAll("input, textarea");
+    for (const el of domInputs) {
+      try {
+        if (el.closest("#ioe-master-root")) continue; // never touch OUR OWN hint input (BUG#6)
+        const st = window.getComputedStyle(el);
+        const hidden = st.display === "none" || st.visibility === "hidden" || (el.type === "hidden");
+        if (!hidden && !(el.offsetWidth === 0 && el.offsetHeight === 0) && el.type !== "file") continue; // only invisible engine inputs
+        if (el.readOnly || el.disabled) continue;
+        el.value = text;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        touched++;
+      } catch (e) {}
+    }
+    return touched;
+  }
+
+  // Find the real DOM <input>/<textarea> that Cocos parks for the focused
+  // EditBox. Live-validated on tai-tao-san-ho: setting eb.string alone does
+  // NOT render the text (game showed "Vui lòng nhập đủ số ký tự" and the box
+  // stayed empty) — the game reads/renders the DOM input the engine creates
+  // on focus. Typing into THAT input, char by char, is what a real user does.
+  function findCocosEditDomInput() {
+    // 1. The element the engine just focused (eb.focus() focuses it)
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) {
+      try { if (!ae.closest("#ioe-master-root")) return ae; } catch (e) { return ae; }
+    }
+    // 2. Hidden/zero-size engine inputs in the canvas container
+    const cv = getCanvas();
+    const roots = [cv ? (cv.parentElement || cv) : null, document.body].filter(Boolean);
+    for (const root of roots) {
+      const els = root.querySelectorAll("input, textarea");
+      for (const el of els) {
+        try {
+          if (el.closest("#ioe-master-root")) continue;
+          if (el.type === "file" || el.disabled || el.readOnly) continue;
+          const st = window.getComputedStyle(el);
+          const tiny = el.offsetWidth < 4 || el.offsetHeight < 4;
+          const invisible = st.display === "none" || st.visibility === "hidden" || Number(st.opacity) === 0;
+          if (tiny || invisible) return el;
+        } catch (e) {}
+      }
+    }
+    return null;
+  }
+
+  // ============ GAME CONTROLLER (validated live on tai-tao-san-ho) ============
+  // The listening fill-word game keeps its answer in TWO places:
+  //   ctrl.inputTxt            — updated ONLY via the EditBox text-changed event
+  //                              (handler onEditTextChange); used for validation
+  //                              ("Vui lòng nhập đủ số ký tự") + submit
+  //   dienDoanVan.results[].string — what the game shows/scores per slot
+  // Setting eb.string alone renders nothing and validates nothing. The
+  // RELIABLE path is calling the controller's own methods directly.
+  function findQuestionController() {
+    const cc = getCC();
+    if (!cc || !cc.Component) return null;
+    for (const n of allNodes()) {
+      if (!n || n.activeInHierarchy === false) continue;
+      try {
+        const comps = n.getComponents ? n.getComponents(cc.Component) : [];
+        for (const comp of comps) {
+          if (comp && typeof comp.onKeyEnterPress === "function" && typeof comp.onEditTextChange === "function") {
+            return comp;
+          }
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  async function typeIntoEditBox(text, index) {
+    // Late system dialogs block typing too — clear first.
+    const dismissed = dismissSystemPopups();
+    const cc = getCC();
+    const boxes = findEditBoxes();
+    if (!boxes.length) return { ok: false, reason: "no_editbox", boxes: 0, dismissed };
+    const idx = Math.max(0, Math.min(index || 0, boxes.length - 1));
+    const eb = boxes[idx].editBox;
+    const word = String(text || "").trim();
+    let typedViaDom = 0;
+    let viaController = false;
+
+    // --- 0. THE REAL PATH: drive the game's own controller (live-validated:
+    //     this is the only route that updates inputTxt → validation → submit;
+    //     direct eb.string assignment renders nothing and the game rejects it
+    //     with "Vui lòng nhập đủ số ký tự"). ---
+    try {
+      const ctrl = findQuestionController();
+      if (ctrl) {
+        ctrl.onEditTextChange(word);          // inputTxt = word
+        try { if (ctrl.dienDoanVan && ctrl.dienDoanVan.getFirstEditBox) { const fe = ctrl.dienDoanVan.getFirstEditBox(); if (fe) fe.string = word; } } catch (e) {}
+        viaController = true;
+      }
+    } catch (e) {}
+
+    // --- 1. ALSO click the EditBox like a user + type into the engine's DOM
+    //     input (keeps engine-side state consistent on OTHER Cocos games where
+    //     the controller pattern does not exist). ---
+    try { clickNode(boxes[idx].node); } catch (e) {}
+    await sleep(180);
+    try {
+      if (typeof eb.focus === "function") eb.focus();
+    } catch (e) {}
+    await sleep(80);
+    const dom = findCocosEditDomInput();
+    if (dom) {
+      try {
+        dom.focus();
+        dom.value = "";
+        for (const ch of word) {
+          dom.value += ch;
+          try {
+            dom.dispatchEvent(new KeyboardEvent("keydown", { key: ch, code: "Key" + ch.toUpperCase(), bubbles: true, cancelable: true }));
+            dom.dispatchEvent(new KeyboardEvent("keypress", { key: ch, code: "Key" + ch.toUpperCase(), bubbles: true, cancelable: true }));
+          } catch (e) {}
+          dom.dispatchEvent(new Event("input", { bubbles: true }));
+          await sleep(getRandom(30, 85));
+        }
+        dom.dispatchEvent(new Event("input", { bubbles: true }));
+        dom.dispatchEvent(new Event("change", { bubbles: true }));
+        try { dom.dispatchEvent(new KeyboardEvent("keyup", { key: word.slice(-1) || "", bubbles: true })); } catch (e) {}
+        typedViaDom = (dom.value || "").length;
+      } catch (e) {}
+    }
+
+    // --- 2. Engine-side sync (idempotent; CC2 & CC3 compatible) ---
+    try {
+      eb.string = word;
+      try {
+        const evtName = (cc.EditBox && cc.EditBox.EventType && cc.EditBox.EventType.TEXT_CHANGED) || "text-changed";
+        if (eb.node && eb.node.emit) eb.node.emit(evtName, word, eb);
+      } catch (e) {}
+    } catch (e) {
+      return { ok: false, reason: e.message, boxes: boxes.length };
+    }
+    syncCocosDomInputs(word);
+    return { ok: true, boxes: boxes.length, typed: word, typedViaDom, viaController, dismissed };
+  }
+
+  // Click the game's ANSWER / confirm button ("Click ANSWER or use ENTER key")
+  function confirmAnswer() {
+    // 0. System dialogs that appear LATE (after start — e.g. the Windows-10
+    //    upgrade notice) dim the whole screen and swallow every input. Dismiss
+    //    them FIRST or the answer button click is a silent no-op.
+    dismissSystemPopups();
+    // 0b. THE REAL PATH on fill-word games: the controller's own Enter handler
+    //     validates inputTxt and fires the AnswerCheck API directly — the
+    //     button click is only a fallback (live-validated: ctrl.onKeyEnterPress
+    //     scored 10/10 on a real question).
+    try {
+      const ctrl = findQuestionController();
+      if (ctrl && findEditBoxes().length) {
+        ctrl.onKeyEnterPress();
+        return { ok: true, via: "controller.onKeyEnterPress" };
+      }
+    } catch (e) {}
+    // 1. Well-known button node names
+    const names = ["btn_answer", "btnAnswer", "answer_btn", "btnSubmit", "btn_submit", "submit_btn", "btnOK", "ok_btn", "btn_ok"];
+    for (const nm of names) {
+      const n = findNodeByName(nm);
+      if (n) { const ok = clickNode(n); if (ok) return { ok: true, via: "name:" + nm }; }
+    }
+    // 1b. Fill-word games name their ANSWER button "btnA" (validated live on
+    //     tai-tao-san-ho). Only trust this name when an EditBox is on screen —
+    //     in MCQ games "btnA" would be the option-A button instead.
+    if (findEditBoxes().length) {
+      const n = findNodeByName("btnA");
+      if (n) { const ok = clickNode(n); if (ok) return { ok: true, via: "name:btnA(editbox)" }; }
+    }
+    // 2. Button whose label reads ANSWER / OK / Trả lời
+    for (const label of ["answer", "trả lời", "ok", "confirm", "submit"]) {
+      const n = findNodeByText(label, { contains: true });
+      if (n) { const ok = clickNode(n); if (ok) return { ok: true, via: "text:" + label }; }
+    }
+    // 3. Keyboard ENTER on the canvas (gameDesc says ENTER confirms the answer)
+    const cv = getCanvas();
+    if (cv) {
+      try {
+        const opts = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true, view: window };
+        cv.dispatchEvent(new KeyboardEvent("keydown", opts));
+        cv.dispatchEvent(new KeyboardEvent("keyup", opts));
+        return { ok: true, via: "keyboard-enter" };
+      } catch (e) {}
+    }
+    return { ok: false, reason: "no_confirm_target" };
+  }
+
+  // Dismiss late-appearing system dialogs (e.g. the Windows-10 upgrade notice).
+  // Live-validated structure on ioe.vn:
+  //   Canvas > POPUP_COMMON > actions > (unnamed OK Button 147x71)
+  //   Canvas > fadedBackground        (the popup's dim backdrop, a sibling)
+  // SAFETY: this no-ops unless a popup is ACTUALLY open — an active node named
+  // /^POPUP/ or a visible "Thông báo/Khuyến cáo" title label. It then clicks
+  // ONLY buttons inside the POPUP subtree, so gameplay buttons are never touched.
+  function dismissSystemPopups() {
+    let closed = 0;
+    try {
+      const cc = getCC();
+      if (!cc) return closed;
+      const nodes = allNodes().filter(n => n && n.activeInHierarchy !== false);
+      const popupNode = nodes.find(n => /^popup/i.test(n.name || ""));
+      const hasNoticeLabel = nodes.some(n => {
+        try {
+          const l = cc.Label && n.getComponent && n.getComponent(cc.Label);
+          return !!(l && /th\u00f4ng b\u00e1o|khuy\u1ebfn c\u00e1o|notice|h\u1ec7 th\u1ed1ng/i.test(l.string || ""));
+        } catch (e) { return false; }
+      });
+      if (!popupNode && !hasNoticeLabel) return 0;
+
+      if (popupNode) {
+        // Click every active Button inside the POPUP subtree (the OK button).
+        for (const n of nodes) {
+          if (n === popupNode || !isButton(n) || (n.width || 0) > 800) continue;
+          let p = n.parent, under = false, guard = 0;
+          while (p && guard < 25) { if (p === popupNode) { under = true; break; } p = p.parent; guard++; }
+          if (under) { clickNode(n); closed++; }
+        }
+      } else {
+        // Variant without a named POPUP node: click small centered buttons
+        // (the OK of the dialog) — dim-layer fallback.
+        let vs = null;
+        try { vs = cc.view.getVisibleSize(); } catch (e) {}
+        const vw = (vs && vs.width) || 1;
+        const dim = nodes.find(n => isButton(n) && (n.width || 0) > vw * 0.6 && /fade|dim|dark|background/i.test(n.name || ""));
+        if (dim) {
+          const dp = nodeWorld(dim);
+          const dw = dim.width || 0, dh = dim.height || 0;
+          for (const n of nodes) {
+            if (n === dim || !isButton(n) || (n.width || 0) > vw * 0.6) continue;
+            const pt = nodeWorld(n);
+            if (pt.x >= dp.x - dw / 2 && pt.x <= dp.x + dw / 2 && pt.y >= dp.y - dh / 2 && pt.y <= dp.y + dh / 2) { clickNode(n); closed++; }
+          }
+        }
+      }
+    } catch (e) {}
+    return closed;
   }
 
   // Text of the question currently ON SCREEN (active only), plus its number if a
@@ -504,7 +856,7 @@
           reply(reqId, "CURRENT_QUESTION_OK", currentQuestionInfo());
           break;
         case "START_GAME":
-          reply(reqId, "START_GAME_OK", startGame());
+          reply(reqId, "START_GAME_OK", await startGame());
           break;
         case "CLICK_TEXT":
           reply(reqId, "CLICK_TEXT_OK", { ok: clickNode(findNodeByText((d.data || {}).text, { contains: !!(d.data || {}).contains })) });
@@ -518,6 +870,27 @@
           break;
         case "CLICK_SEQUENCE":
           reply(reqId, "SEQ_OK", await clickSequence((d.data || {}).items || [], (d.data || {}).runId));
+          break;
+        case "TYPE_EDITBOX":
+          reply(reqId, "TYPE_EDITBOX_OK", await typeIntoEditBox((d.data || {}).text, (d.data || {}).index));
+          break;
+        case "CONFIRM_ANSWER":
+          reply(reqId, "CONFIRM_ANSWER_OK", confirmAnswer());
+          break;
+        case "DISMISS_POPUPS":
+          reply(reqId, "DISMISS_POPUPS_OK", { closed: dismissSystemPopups() });
+          break;
+        case "LIST_EDITBOXES":
+          reply(reqId, "EDITBOXES", findEditBoxes().map(b => ({ name: b.name, string: b.string })));
+          break;
+        case "CONTROLLER_INFO":
+          (async () => {
+            const c = findQuestionController();
+            reply(reqId, "CONTROLLER_INFO_OK", c ? {
+              found: true, inputTxt: c.inputTxt, canClick: c.canClick,
+              hasDienDoanVan: !!c.dienDoanVan
+            } : { found: false });
+          })();
           break;
         default:
           break;
@@ -534,7 +907,11 @@
     listNodes: listNodes,
     startGame: startGame,
     clickText: (t) => clickNode(findNodeByText(t, { contains: true })),
-    clickName: (n) => clickNode(findNodeByName(n))
+    clickName: (n) => clickNode(findNodeByName(n)),
+    typeIntoEditBox: typeIntoEditBox,
+    confirmAnswer: confirmAnswer,
+    dismissSystemPopups: dismissSystemPopups,
+    findQuestionController: findQuestionController
   };
 
   // Announce readiness so the isolated script can request a re-sync if needed.

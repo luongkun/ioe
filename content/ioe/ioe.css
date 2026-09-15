@@ -3,7 +3,10 @@
 #ioe-master-root {
   position: fixed;
   top: 12px;
-  right: 12px;
+  /* BUG#4: keep to the LEFT — the right corner hosts ioe.vn's Đăng nhập button
+     and the game's answer-input area; overlapping them broke login & gameplay. */
+  left: 12px;
+  right: auto;
   z-index: 2147483647;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 13px;
@@ -22,6 +25,7 @@
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   user-select: none;
+  max-width: calc(100vw - 24px);
 }
 
 .ioe-control-pill:hover {
@@ -44,8 +48,12 @@
 
 .ioe-pill-title {
   font-weight: 700;
-  font-size: 13px;
+  font-size: 12px;
   letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 150px;
 }
 
 .ioe-audio-pill {
@@ -109,9 +117,12 @@
 .ioe-panel {
   position: fixed;
   top: 60px;
-  right: 20px;
+  /* BUG#4: default to the LEFT side; still draggable via its header. */
+  left: 20px;
+  right: auto;
   width: 440px;
   max-width: calc(100vw - 30px);
+  max-height: calc(100vh - 90px);
   background: #ffffff;
   border-radius: 14px;
   box-shadow: 0 20px 40px rgba(0, 0, 0, 0.28), 0 0 0 1px rgba(0,0,0,0.08);

@@ -32,6 +32,7 @@
 
   // 1.5 GAME API BRIDGE (Cocos Creator IOE games) - receives exact exam JSON
   let gameBridgeState = null;
+  let gameBridgeError = null;
 
   window.addEventListener("message", (ev) => {
     if (ev.source !== window) return;
@@ -39,6 +40,7 @@
     if (!d || !d.__ioeBridge) return;
     if (d.type === "GETINFO" || d.type === "SYNC") {
       gameBridgeState = d.payload || null;
+      gameBridgeError = null;
       if (gameBridgeState && gameBridgeState.questions) {
         const n = gameBridgeState.questions.length;
         console.log(`[English Master AI] 🎮 IOE game API: ${n} câu hỏi (examKey ${gameBridgeState.examKey})`);
@@ -48,6 +50,11 @@
           badge.classList.remove("hidden");
         }
       }
+    } else if (d.type === "GETINFO_ERROR") {
+      // BUG#8: token game chỉ dùng 1 lần — báo rõ thay vì đứng im
+      gameBridgeError = (d.extra && d.extra.message) || "Lỗi quyền truy cập";
+      console.warn("[English Master AI] ⚠️ API game từ chối: " + gameBridgeError);
+      showToast("⚠️ API game từ chối (token mỗi lần chỉ dùng 1 lần). Hãy tải lại trang (F5) rồi bấm Tự Làm lại.");
     } else if (d.type === "ANSWERCHECK") {
       if (gameBridgeState) gameBridgeState.lastAnswerCheck = d.payload;
     }
@@ -106,7 +113,7 @@
     const pairs = [];
     for (const q of qs) {
       const prompt = (q.prompt || "").trim();
-      const ans = (q.answers && q.answers.length) ? String(q.answers[0]).trim() : "";
+      const ans = (q.tans && q.tans.length) ? String(q.tans[0]).trim() : ((q.answers && q.answers.length) ? String(q.answers[0]).trim() : "");
       if (!prompt || !ans) continue;
       if (isImageRef(prompt) || isImageRef(ans)) continue;
       if (/^https?:\/\//i.test(prompt) || /^https?:\/\//i.test(ans)) continue;
@@ -115,72 +122,439 @@
     return pairs;
   }
 
+  // ===================== DATA-DRIVEN EXAM CLASSIFIER (BUG#1 fix) =====================
+  // Classify from the ACTUAL API payload (mask/answers/tans/format/audio) — NOT from
+  // the game URL or name — so a NEW game type or the "same exam in a different
+  // form" is still recognised correctly every time.
+  function classifyExam(qs) {
+    if (!qs || !qs.length) return "unknown";
+    const allF25 = qs.every(q => q.format === 25);
+    const allListening = qs.every(q => q.isListening && q.audio);
+    const allMasked = qs.every(q => q.masked);
+    const withTans = qs.filter(q => q.tans && q.tans.length);
+    const withOptions = qs.filter(q => q.answers && q.answers.length >= 2);
+    const textPairs = deriveMatchPairsFromGameApi();
+
+    // Thứ tự quan trọng: lựa chọn (options) / đáp án sẵn (tans) được xét TRƯỚC
+    // mask — đề trắc nghiệm có stem "______" không bị nhận nhầm thành điền từ.
+    if (allF25 && textPairs.length >= Math.ceil(qs.length * 0.5)) return "matching";
+    if (withTans.length === qs.length) return "mcq_known";   // every answer already in API
+    if (withOptions.length === qs.length) return "mcq_multi"; // options but no tans → AI picks
+    if (allMasked) return "listening_fillword";               // masked prompts, NO options → listen & type
+    if (allListening) return "listening_tf";
+    return "unknown";                                         // mixed / brand-new type → generic AI
+  }
+
+  // ===================== PER-QUESTION ANSWER CACHE ("cùng đề, khác dạng") =====================
+  // Key = audio URL (unique per question) hoặc prompt đã chuẩn hoá + đáp án → một
+  // câu hỏi lặp lại (dù đổi hình thức trình bày) được trả lời NGAY và NHẤT QUÁN.
+  const QCACHE_KEY = "ioe_qcache";
+  let qCacheMem = null;
+  function qNorm(s) {
+    return String(s || "").toLowerCase()
+      .replace(/\*{2,}|_{2,}/g, "#")
+      .replace(/[^\p{L}\p{N}# ]/gu, " ")
+      .replace(/\s+/g, " ").trim();
+  }
+  function qCacheKeyFor(q, pool) {
+    // BUG#11: IOE re-randomises the answerPool between attempts while REUSING
+    // the same audio URLs — a cache keyed on audio alone returns the OLD
+    // attempt's word (wrong length for the new mask). Mix the pool in.
+    const poolPart = (Array.isArray(pool) && pool.length) ? "|pool:" + pool.join(",").toLowerCase() : "";
+    if (q.audio) return "a:" + q.audio + "|m:" + (q.maskPrefix || "") + (q.maskStars || 0) + poolPart;
+    return "p:" + qNorm(q.prompt) + "|o:" + (q.answers || []).map(qNorm).join("~") + poolPart;
+  }
+  async function getQCache() {
+    if (qCacheMem) return qCacheMem;
+    try {
+      const data = await chrome.storage.local.get({ [QCACHE_KEY]: {} });
+      qCacheMem = (data && data[QCACHE_KEY]) ? data[QCACHE_KEY] : {};
+    } catch (e) { qCacheMem = {}; }
+    return qCacheMem;
+  }
+  async function saveQCacheEntry(key, answer) {
+    try {
+      const cache = await getQCache();
+      cache[key] = { answer: String(answer), ts: Date.now() };
+      const keys = Object.keys(cache);
+      if (keys.length > 500) {
+        keys.sort((a, b) => (cache[a].ts || 0) - (cache[b].ts || 0));
+        for (const k of keys.slice(0, keys.length - 500)) delete cache[k];
+      }
+      await chrome.storage.local.set({ [QCACHE_KEY]: cache });
+    } catch (e) {}
+  }
+
+  // "[FILL_WORDS: 1. supposed, 2. meets]" / "[MCQ_ANSWERS: 1. B, 2. A]" → array theo số thứ tự
+  function parseTagItems(inner) {
+    const s = String(inner || "");
+    const numbered = s.match(/(\d+)\s*[.):\-\s]+[^,;]+/g);
+    if (numbered && numbered.length >= 2) {
+      const out = [];
+      for (const tok of numbered) {
+        const m = tok.match(/(\d+)\s*[.):\-\s]+(.+)/);
+        if (m) out[parseInt(m[1], 10) - 1] = m[2].trim();
+      }
+      if (out.some(x => x != null && x !== "")) return out;
+    }
+    return s.split(/[,;\n]+/).map(x => x.trim()).filter(Boolean);
+  }
+
+  // Ask the AI directly with a built prompt (game-API path — no screenshot needed)
+  function askAiForGame(promptText, opts) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({
+          action: "SOLVE_CURRENT_SCREEN",
+          images: null,
+          text: "\n\n" + promptText,
+          audioUrl: null,
+          audioBase64: null,
+          audioUrls: (opts && opts.audioUrls) || null,
+          hint: "",
+          examKind: (opts && opts.examKind) || null
+        }, resolve);
+      } catch (e) { resolve(null); }
+    });
+  }
+
+  function buildFillWordPrompt(qs, indices, st) {
+    const lines = [];
+    lines.push("ĐỀ THI NGHE ĐIỀN TỪ — đọc trực tiếp từ API GAME IOE (chính xác 100%, không cần OCR):");
+    if (st && st.gameDesc) lines.push("Hướng dẫn game: " + st.gameDesc);
+    if (st && st.answerPool && st.answerPool.length) {
+      lines.push("KHO TỪ GỢI Ý (ưu tiên khi khớp cả NGHĨA lẫn ĐỘ DÀI chữ cái): " + st.answerPool.join(", "));
+    }
+    lines.push("");
+    lines.push(`Tổng số câu cần giải: ${indices.length}`);
+    lines.push("");
+    indices.forEach((qi, k) => {
+      const q = qs[qi];
+      const stars = q.maskStars ? "*".repeat(Math.min(q.maskStars, 20)) : "*****";
+      const maskHint = q.masked
+        ? ` [TỪ BỊ CHE: "${(q.maskPrefix || "") + stars}" — ${q.maskStars || "?"} chữ cái bị ẩn${q.maskPrefix ? `, tiền tố đã biết "${q.maskPrefix}"` : ""}]`
+        : "";
+      lines.push(`Câu ${k + 1} — file audio đính kèm nhãn [AUDIO CÂU ${k + 1}]:`);
+      lines.push(`  Câu khẳng định: ${q.prompt}${maskHint}`);
+    });
+    lines.push("");
+    lines.push(`YÊU CẦU: Nghe TỪNG file audio, xác định TỪ BỊ CHE trong câu khẳng định tương ứng (đúng dạng ngữ pháp: chia động từ, số nhiều...). Trả về dòng đầu tiên ĐÚNG định dạng: [FILL_WORDS: 1. từ_câu_1, 2. từ_câu_2, ...] với ĐỦ ${indices.length} từ, mỗi câu ĐÚNG 1 từ.`);
+    return lines.join("\n");
+  }
+
+  function buildMcqMultiPrompt(qs, indices, st) {
+    const lines = [];
+    lines.push("ĐỀ THI TRẮC NGHIỆM NHIỀU CÂU — đọc trực tiếp từ API GAME IOE (chính xác 100%, không cần OCR):");
+    if (st && st.gameDesc) lines.push("Hướng dẫn game: " + st.gameDesc);
+    lines.push("");
+    lines.push(`Tổng số câu: ${indices.length}`);
+    lines.push("");
+    indices.forEach((qi, k) => {
+      const q = qs[qi];
+      lines.push(`Câu ${k + 1}: ${q.prompt || "(xem hình)"}`);
+      (q.answers || []).forEach((a, ai) => lines.push(`  ${String.fromCharCode(65 + ai)}. ${a}`));
+    });
+    lines.push("");
+    lines.push(`YÊU CẦU: Giải TỪNG câu, chọn 1 lựa chọn đúng. Dòng đầu tiên ĐÚNG định dạng: [MCQ_ANSWERS: 1. B, 2. A, ...] với ĐỦ ${indices.length} kết quả.`);
+    return lines.join("\n");
+  }
+
+  // Wait until the on-screen question is fully rendered (counter or long text)
+  async function waitForQuestionReady(timeoutMs = 12000) {
+    const t0 = Date.now();
+    let info = { qnum: null, text: "" };
+    while (Date.now() - t0 < timeoutMs) {
+      info = await getCurrentTfQuestionInfo();
+      const ready = (info.qnum !== null && info.qnum >= 1) || (info.text && info.text.length >= 10);
+      if (ready) { await sleep(1000); return info; }
+      await sleep(300);
+    }
+    return info;
+  }
+
+  // Generic per-question executor: the game must ALREADY be started (callers
+  // start it BEFORE the slow AI call — the real games time out their intro
+  // screen if you wait). Runs the action for each question, then blocks until
+  // the game actually animates to the NEXT question (never click blind).
+  async function runPerQuestionActions(total, actionFn, label) {
+    let lastQinfo = await waitForQuestionReady();
+    let done = 0;
+    for (let i = 0; i < total; i++) {
+      let ok = false;
+      try { ok = await actionFn(i); } catch (e) { console.warn("[English Master AI] per-question action error:", e); }
+      if (ok) done++;
+      if (i < total - 1) {
+        const w = await waitForTfNextQuestion(lastQinfo, 15000);
+        if (w.ok) {
+          lastQinfo = w.info;
+        } else if (w.unreadable) {
+          await sleep(getRandomHumanDelay(4200, 5200));
+          lastQinfo = await getCurrentTfQuestionInfo();
+        } else {
+          await sleep(getRandomHumanDelay(3500, 5000));
+          lastQinfo = await getCurrentTfQuestionInfo();
+        }
+      }
+    }
+    showToast(`${label}: ${done}/${total} câu!`);
+    return done;
+  }
+
+  // =============== LISTENING FILL-WORD SOLVER (BUG#1/#2/#3 fix) ===============
+  // AI nghe từng file audio → tìm từ bị che → GÕ vào EditBox Cocos → bấm ANSWER.
+  // Câu đã từng giải (cache) được điền ngay không cần gọi AI lại.
+  async function solveAndTypeFillWords(qs, st) {
+    createIOEUI();
+    panelEl.classList.remove("hidden");
+    // START the game IMMEDIATELY (before the slow AI call): the real games
+    // time out their instruction screen while we wait for the AI.
+    await ioeBridgeRequest("START_GAME", {}, 6000);
+    const cache = await getQCache();
+    const answers = new Array(qs.length).fill(null);
+    const unknownIdx = [];
+    const pool = (st && st.answerPool) || [];
+    qs.forEach((q, i) => {
+      const c = cache[qCacheKeyFor(q, pool)];
+      if (c && c.answer) answers[i] = c.answer;
+      else unknownIdx.push(i);
+    });
+
+    if (unknownIdx.length) {
+      const cachedCount = qs.length - unknownIdx.length;
+      showToast(`🎧 Bài nghe điền từ: AI đang nghe ${unknownIdx.length}/${qs.length} câu${cachedCount ? ` (đã nhớ ${cachedCount} câu gặp trước đó)` : ""}...`);
+      const promptText = buildFillWordPrompt(qs, unknownIdx, st);
+      const audioUrls = unknownIdx.map(i => qs[i].audio).filter(Boolean);
+      const resp = await askAiForGame(promptText, { audioUrls, examKind: "fillword" });
+      const tag = (resp && resp.success) ? String(resp.data || "").match(/\[FILL_WORDS:\s*([^\]]+)\]/i) : null;
+      if (tag) {
+        const items = parseTagItems(tag[1]);
+        unknownIdx.forEach((qi, k) => {
+          const w = items[k] != null ? String(items[k]).trim() : "";
+          if (w) {
+            answers[qi] = w.replace(/^["']|["']$/g, "");
+            saveQCacheEntry(qCacheKeyFor(qs[qi], pool), answers[qi]);
+          }
+        });
+      } else {
+        showToast("⚠️ AI không trả được danh sách từ — hãy bấm lại Tự Làm.");
+      }
+    } else {
+      showToast(`⚡ Đã nhớ sẵn đáp án cả ${qs.length} câu (câu hỏi lặp lại) — điền ngay không cần AI!`);
+    }
+
+    // Câu AI bỏ sót: thử ghép với kho từ (answerPool) theo tiền tố + độ dài
+    const pool2 = (st && st.answerPool) || [];
+    qs.forEach((q, i) => {
+      if (!answers[i] && pool2.length) {
+        const hit = pool2.find(w => {
+          const lw = String(w).toLowerCase();
+          const pref = (q.maskPrefix || "").toLowerCase();
+          const needLen = (q.maskPrefix || "").length + (q.maskStars || 0);
+          return (!pref || lw.startsWith(pref)) && (!needLen || lw.length === needLen);
+        });
+        if (hit) answers[i] = hit;
+      }
+    });
+
+    renderFillWordsResult(qs, answers);
+
+    const total = qs.length;
+    const typed = await runPerQuestionActions(total, async (i) => {
+      const word = answers[i];
+      if (!word) return false;
+      const typeResp = await ioeBridgeRequest("TYPE_EDITBOX", { text: word, index: 0 }, 8000);
+      const typedOk = !!(typeResp && typeResp.payload && typeResp.payload.ok);
+      if (!typedOk) {
+        // Game dùng chip từ bấm được thay cho EditBox → bấm chip
+        const clickResp = await ioeBridgeRequest("CLICK_TEXT", { text: word, contains: true }, 8000);
+        if (!(clickResp && clickResp.payload && clickResp.payload.ok)) return false;
+      }
+      await sleep(getRandomHumanDelay(600, 1100));
+      await ioeBridgeRequest("CONFIRM_ANSWER", {}, 8000);
+      showToast(`✍️ Câu ${i + 1}/${total}: ${word}`);
+      return true;
+    }, "✍️ Điền từ xong");
+
+    return typed > 0;
+  }
+
+  // =============== MULTI-MCQ SOLVER (options in API, AI picks) ===============
+  async function solveAndClickMcqMulti(qs, st) {
+    createIOEUI();
+    panelEl.classList.remove("hidden");
+    // Start BEFORE the AI call (see solveAndTypeFillWords).
+    await ioeBridgeRequest("START_GAME", {}, 6000);
+    const cache = await getQCache();
+    const picks = new Array(qs.length).fill(null); // "B"...
+    const pool = (st && st.answerPool) || [];
+    const unknownIdx = [];
+    qs.forEach((q, i) => {
+      const c = cache[qCacheKeyFor(q, pool)];
+      if (c && c.answer) picks[i] = c.answer;
+      else unknownIdx.push(i);
+    });
+
+    if (unknownIdx.length) {
+      showToast(`🎯 Trắc nghiệm ${qs.length} câu: AI đang giải ${unknownIdx.length} câu còn lại...`);
+      const resp = await askAiForGame(buildMcqMultiPrompt(qs, unknownIdx, st), { examKind: "mcq_multi" });
+      const tag = (resp && resp.success) ? String(resp.data || "").match(/\[MCQ_ANSWERS:\s*([^\]]+)\]/i) : null;
+      if (tag) {
+        const items = parseTagItems(tag[1]);
+        unknownIdx.forEach((qi, k) => {
+          const v = items[k] != null ? String(items[k]).trim().toUpperCase() : "";
+          const m = v.match(/^([A-D])/);
+          if (m) {
+            picks[qi] = m[1];
+            saveQCacheEntry(qCacheKeyFor(qs[qi], pool), m[1]);
+          }
+        });
+      }
+    } else {
+      showToast(`⚡ Đã nhớ sẵn đáp án cả ${qs.length} câu trắc nghiệm — làm ngay!`);
+    }
+
+    renderMcqMultiResult(qs, picks);
+
+    const total = qs.length;
+    const done = await runPerQuestionActions(total, async (i) => {
+      const letter = picks[i];
+      if (!letter) return false;
+      const q = qs[i];
+      const li = letter.charCodeAt(0) - 65;
+      const optText = (q.answers && q.answers[li]) || "";
+      let resp = null;
+      if (optText) resp = await ioeBridgeRequest("CLICK_TEXT", { text: optText, contains: true }, 8000);
+      if (!resp || !resp.payload || !resp.payload.ok) {
+        for (const nm of ["btn" + letter, "btn_" + letter.toLowerCase(), "ans" + letter, "choice" + letter]) {
+          resp = await ioeBridgeRequest("CLICK_NAME", { name: nm }, 8000);
+          if (resp && resp.payload && resp.payload.ok) break;
+        }
+      }
+      if (resp && resp.payload && resp.payload.ok) {
+        showToast(`🎯 Câu ${i + 1}/${total}: ${letter}${optText ? " — " + optText : ""}`);
+        return true;
+      }
+      return false;
+    }, "🎯 Trắc nghiệm xong");
+
+    return done > 0;
+  }
+
+  function renderFillWordsResult(qs, answers) {
+    const qBox = ioeRootEl?.querySelector("#ioe-question-display");
+    const contentBox = ioeRootEl?.querySelector("#ioe-panel-content");
+    if (qBox) qBox.textContent = `✍️ Nghe-điền-từ: ${answers.filter(Boolean).length}/${qs.length} từ đã có`;
+    if (!contentBox) return;
+    const chips = qs.map((q, i) => {
+      const w = answers[i];
+      const bg = w ? "background:#ede9fe;border-color:#7c3aed;" : "background:#fee2e2;border-color:#ef4444;";
+      return `<span class="ioe-slot-chip" data-act="type" data-word="${escapeHtml(w || "")}" style="${bg}cursor:pointer;" title="Click để gõ lại từ này vào ô trống">${i + 1}. <strong>${escapeHtml(w || "?")}</strong></span>`;
+    }).join("");
+    contentBox.innerHTML = `
+      <div class="ioe-ans-banner">
+        <div class="ioe-ans-label"><span>✍️ KẾT QUẢ NGHE ĐIỀN TỪ (${qs.length} CÂU)</span></div>
+        <div class="ioe-slot-chips">${chips}</div>
+        <div style="margin-top:8px;font-size:11.5px;color:#64748b;">Nhấn "Tự Làm" để tự điền toàn bộ, hoặc click từng ô để gõ lại từ đó.</div>
+      </div>`;
+  }
+
+  function renderMcqMultiResult(qs, picks) {
+    const qBox = ioeRootEl?.querySelector("#ioe-question-display");
+    const contentBox = ioeRootEl?.querySelector("#ioe-panel-content");
+    if (qBox) qBox.textContent = `🎯 Trắc nghiệm: ${picks.filter(Boolean).length}/${qs.length} câu đã có đáp án`;
+    if (!contentBox) return;
+    const chips = qs.map((q, i) => {
+      const v = picks[i];
+      const bg = v ? "background:#dcfce7;border-color:#10b981;" : "background:#fee2e2;border-color:#ef4444;";
+      const opt = v ? ((q.answers || [])[v.charCodeAt(0) - 65] || "") : "";
+      return `<span class="ioe-slot-chip" style="${bg}">${i + 1}. <strong>${v || "?"}</strong>${opt ? " · " + escapeHtml(opt) : ""}</span>`;
+    }).join("");
+    contentBox.innerHTML = `
+      <div class="ioe-ans-banner">
+        <div class="ioe-ans-label"><span>🎯 KẾT QUẢ TRẮC NGHIỆM (${qs.length} CÂU)</span></div>
+        <div class="ioe-slot-chips">${chips}</div>
+      </div>`;
+  }
+
+  // =============== UNIFIED COCOS SOLVER (single source of truth) ===============
+  async function solveCocosGameWithApi() {
+    const st = getGameBridgeStateDirect();
+    if (!st || !st.questions || !st.questions.length) return false;
+    const qs = st.questions;
+    const kind = classifyExam(qs);
+    console.log("[English Master AI] 🎮 Phân loại đề từ dữ liệu API: " + kind);
+
+    // START the game up-front for every solver path — the real games expire
+    // their instruction screen in seconds, while the AI call (audio fetch +
+    // transcribe) can take much longer. Starting first keeps the round alive.
+    await ioeBridgeRequest("START_GAME", {}, 6000);
+    await sleep(2000);
+
+    // Matching (format 25, text pairs): exact API pairs, no AI
+    if (kind === "matching") {
+      const pairs = deriveMatchPairsFromGameApi();
+      if (pairs.length) {
+        await ioeBridgeRequest("AUTO_MATCH", { pairs, runId: "match_" + Date.now() }, 30000 + pairs.length * 3000);
+        showToast(`✅ Cocos: đã tự ghép ${pairs.length} cặp!`);
+        return true;
+      }
+    }
+
+    // MCQ known (every answer already in the API via tans)
+    if (kind === "mcq_known") {
+      const items = [];
+      for (const q of qs) {
+        const ans = (q.tans && q.tans[0]) || (q.answers && q.answers[0]) || "";
+        const txt = String(ans).trim();
+        if (txt && !/^https?:\/\//i.test(txt)) items.push({ text: txt, contains: true, delay: 1400 });
+      }
+      if (items.length) {
+        const seqResp = await ioeBridgeRequest("CLICK_SEQUENCE", { items }, 15000 + items.length * 25000);
+        const seqPayload = seqResp && seqResp.payload;
+        const doneCount = seqPayload && typeof seqPayload.done === "number" ? seqPayload.done : null;
+        if (doneCount !== null && doneCount < items.length) {
+          showToast(`⚠️ Cocos: chỉ click được ${doneCount}/${items.length} đáp án — hãy bấm Giải lại (F2).`);
+        } else {
+          showToast(`✅ Cocos: đã tự chọn ${items.length} đáp án!`);
+        }
+        return true;
+      }
+    }
+
+    if (kind === "listening_fillword") return await solveAndTypeFillWords(qs, st);
+    if (kind === "mcq_multi") return await solveAndClickMcqMulti(qs, st);
+
+    return false; // listening_tf / unknown → caller falls back to the generic AI flow
+  }
+
   // Auto-solve a Cocos Creator IOE game using the exact API JSON + canvas node clicks
   async function autoSolveCocosGame() {
     createIOEUI();
-    const st = getGameBridgeStateDirect();
+    let st = getGameBridgeStateDirect();
     if (!st || !st.questions || !st.questions.length) {
       requestGameBridgeSync();
       await sleep(800);
+      st = getGameBridgeStateDirect();
     }
-    const st2 = getGameBridgeStateDirect();
-    if (!st2 || !st2.questions || !st2.questions.length) {
-      showToast("⚠️ Chưa bắt được dữ liệu API game. Hãy chờ game tải xong rồi thử lại.");
+    if (!st || !st.questions || !st.questions.length) {
+      showToast(gameBridgeError
+        ? "⚠️ API game từ chối truy cập (token đã dùng). Hãy tải lại trang (F5) rồi thử lại."
+        : "⚠️ Chưa bắt được dữ liệu API game. Hãy chờ game tải xong rồi thử lại.");
       return;
     }
 
-    const qs = st2.questions;
-    showToast(`🎮 Cocos: đang tự làm ${qs.length} câu từ API game...`);
+    const handled = await solveCocosGameWithApi();
+    if (handled) return;
 
-    // 1. Start the game (close popups, press start)
-    await ioeBridgeRequest("START_GAME", {}, 6000);
-    await sleep(1200);
-
-    // 2. Matching game (format 25, text pairs only)
-    const pairs = deriveMatchPairsFromGameApi();
-    const isMatching = qs.length > 0 && pairs.length > 0 &&
-      qs.every(q => q.format === 25) &&
-      !qs.some(q => (q.answers || []).some(a => isImageRef(String(a))));
-
-    if (isMatching) {
-      const runId = "match_" + Date.now();
-      await ioeBridgeRequest("AUTO_MATCH", { pairs, runId }, 30000 + pairs.length * 3000);
-      showToast(`✅ Cocos: đã tự ghép ${pairs.length} cặp!`);
-      return;
-    }
-
-    // 3. MCQ / fill: click nodes whose text matches each answer
-    const items = [];
-    for (const q of qs) {
-      const ans = (q.tans && q.tans[0]) || (q.answers && q.answers[0]) || "";
-      const txt = String(ans).trim();
-      if (txt && !/^https?:\/\//i.test(txt)) items.push({ text: txt, contains: true, delay: 1400 });
-    }
-    if (items.length) {
-      // The bridge waits for each option node to appear before clicking —
-      // 25s budget per question; report the REAL done/failed result.
-      const seqResp = await ioeBridgeRequest("CLICK_SEQUENCE", { items }, 15000 + items.length * 25000);
-      const seqPayload = seqResp && seqResp.payload;
-      const doneCount = seqPayload && typeof seqPayload.done === "number" ? seqPayload.done : null;
-      if (doneCount !== null && doneCount < items.length) {
-        showToast(`⚠️ Cocos: chỉ click được ${doneCount}/${items.length} đáp án — hãy bấm Giải lại (F2) để AI giải các câu còn lại.`);
-      } else {
-        showToast(`✅ Cocos: đã tự chọn ${items.length} đáp án!`);
-      }
-      return;
-    }
-
-    // 4. Listening True/False: API has no answers — solve ALL questions with AI
-    //    (multi-audio exam) then auto-click each result. No manual F2 needed.
+    // Listening True/False: API has no answers — solve ALL questions with AI
+    // (multi-audio exam) then auto-click each result. No manual F2 needed.
     showToast("🎧 Bài nghe True/False: đang nhờ AI nghe & giải toàn bộ câu hỏi...");
     await executeScreenAndAudioSolve("", async (success, answer, hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf) => {
       if (!success) {
         showToast("⚠️ AI không giải được bài nghe. Hãy thử lại.");
         return;
       }
-      if (isMultiTf && lastTrueFalseAnswers.length > 0) {
-        await executeTrueFalseClicksSequentially();
-      } else if (lastTrueFalseAnswers.length > 0) {
+      if (lastTrueFalseAnswers.length > 0) {
         await executeTrueFalseClicksSequentially();
       } else {
         showToast("⚠️ AI chưa trả về danh sách True/False. Hãy bấm F2 (Giải) rồi thử lại.");
@@ -212,6 +586,8 @@
   let lastAnswerParsed = "";
   let lastMatchingPairs = [];
   let lastTrueFalseAnswers = [];
+  let lastFillWords = [];
+  let lastMcqPicks = [];
   let isSolving = false;
   let isDragging = false;
   let dragOffset = { x: 0, y: 0 };
@@ -354,6 +730,32 @@
       executeScreenAndAudioSolve("", null, { textOverride: txt });
     });
 
+    // Delegated chip actions (BUG#5 fix: inline onclick chạy ở MAIN world → ReferenceError)
+    ioeRootEl.addEventListener("click", (e) => {
+      const chip = e.target.closest("[data-act]");
+      if (!chip) return;
+      e.stopPropagation();
+      const act = chip.getAttribute("data-act");
+      if (act === "autofill") {
+        triggerUniversalAutoFillOrSelect();
+      } else if (act === "match") {
+        const a = parseInt(chip.getAttribute("data-a"), 10);
+        const b = parseInt(chip.getAttribute("data-b"), 10);
+        if (a && b) clickMatchingPairDirectly(a, b);
+      } else if (act === "copyword") {
+        const w = chip.getAttribute("data-w") || "";
+        navigator.clipboard.writeText(w);
+        showToast(`📋 Đã copy: "${w}"`);
+      } else if (act === "type") {
+        const w = chip.getAttribute("data-word") || "";
+        if (w) {
+          ioeBridgeRequest("TYPE_EDITBOX", { text: w, index: 0 }, 8000).then((r) => {
+            showToast(r && r.payload && r.payload.ok ? `✍️ Đã gõ "${w}" vào ô trống` : "⚠️ Không tìm thấy ô nhập (EditBox) trên màn hình");
+          });
+        }
+      }
+    });
+
     // Shared post-solve auto-click: after ANY solve path (F2 / Giải lại / hint),
     // automatically apply the answer — one-button philosophy.
     const solveAndAutoClick = function (hint) {
@@ -363,6 +765,12 @@
           await executeMatchingClicksSequentially();
         } else if (lastTrueFalseAnswers && lastTrueFalseAnswers.length > 0) {
           await executeTrueFalseClicksSequentially();
+        } else if (lastFillWords && lastFillWords.length > 0) {
+          const qs = getGameQuestions() || [];
+          if (qs.length) await solveAndTypeFillWords(qs, getGameBridgeStateDirect());
+        } else if (lastMcqPicks && lastMcqPicks.length > 0) {
+          const qs = getGameQuestions() || [];
+          if (qs.length) await solveAndClickMcqMulti(qs, getGameBridgeStateDirect());
         } else if (lastAnswerParsed) {
           await triggerUniversalAutoFillOrSelect();
         }
@@ -462,53 +870,18 @@
     }
 
     try {
-      // A. Cocos game with exact API data (matching pairs / MCQ / fill): use it — no AI needed
+      // A. Cocos game with exact API data: classify from the DATA (not URL) and
+      //    dispatch to the right executor — matching / MCQ / listening fill-word / multi-MCQ.
       if (isCocosGame()) {
-        const st = getGameBridgeStateDirect();
+        let st = getGameBridgeStateDirect();
         if (!st || !st.questions || !st.questions.length) {
           requestGameBridgeSync();
           await sleep(800);
+          st = getGameBridgeStateDirect();
         }
-        const st2 = getGameBridgeStateDirect();
-        if (st2 && st2.questions && st2.questions.length) {
-          const qs = st2.questions;
-
-          // A1. Matching (format 25, text pairs)
-          const pairs = deriveMatchPairsFromGameApi();
-          const isMatchingGame = pairs.length > 0 && qs.every(q => q.format === 25);
-          if (isMatchingGame) {
-            await ioeBridgeRequest("START_GAME", {}, 6000);
-            await sleep(1200);
-            await ioeBridgeRequest("AUTO_MATCH", { pairs, runId: "match_" + Date.now() }, 30000 + pairs.length * 3000);
-            showToast(`✅ Cocos: đã tự ghép ${pairs.length} cặp!`);
-            return;
-          }
-
-          // A2. MCQ / fill: API already contains answers
-          const items = [];
-          for (const q of qs) {
-            const ans = (q.tans && q.tans[0]) || (q.answers && q.answers[0]) || "";
-            const txt = String(ans).trim();
-            if (txt && !/^https?:\/\//i.test(txt)) items.push({ text: txt, contains: true, delay: 1400 });
-          }
-          if (items.length) {
-            await ioeBridgeRequest("START_GAME", {}, 6000);
-            await sleep(1200);
-            // The bridge now waits for EACH option node to appear on screen
-            // (game reveals questions one-by-one) — allow 25s per question.
-            const seqResp = await ioeBridgeRequest("CLICK_SEQUENCE", { items }, 15000 + items.length * 25000);
-            const seqPayload = seqResp && seqResp.payload;
-            const doneCount = seqPayload && typeof seqPayload.done === "number" ? seqPayload.done : null;
-            if (doneCount !== null && doneCount < items.length) {
-              showToast(`⚠️ Cocos: chỉ click được ${doneCount}/${items.length} đáp án — đang nhờ AI giải lại các câu còn lại...`);
-              // Fall through to AI solve instead of silently failing
-            } else {
-              showToast(`✅ Cocos: đã tự chọn ${items.length} đáp án!`);
-              return;
-            }
-          }
-
-          // A3. Listening True/False (API has no answers): fall through to AI below
+        if (st && st.questions && st.questions.length) {
+          const handled = await solveCocosGameWithApi();
+          if (handled) return;
         }
       }
 
@@ -533,6 +906,17 @@
         if (lastTrueFalseAnswers && lastTrueFalseAnswers.length > 0) {
           await executeTrueFalseClicksSequentially();
           return;
+        }
+
+        // Listening fill-word / multi-MCQ returned by the generic AI path →
+        // dispatch to the dedicated executors (cache makes the re-solve instant)
+        if (lastFillWords && lastFillWords.length > 0) {
+          const qs = getGameQuestions() || [];
+          if (qs.length) { await solveAndTypeFillWords(qs, getGameBridgeStateDirect()); return; }
+        }
+        if (lastMcqPicks && lastMcqPicks.length > 0) {
+          const qs = getGameQuestions() || [];
+          if (qs.length) { await solveAndClickMcqMulti(qs, getGameBridgeStateDirect()); return; }
         }
 
         // Single True/False / MCQ / fill: click or fill the single answer
@@ -1329,8 +1713,10 @@
       }
     }
 
-    // C. Fill Text Inputs
-    const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, .input-answer, #txtAnswer'));
+    // C. Fill Text Inputs — never touch OUR OWN UI's inputs (BUG#6: the hint box
+    //    #ioe-slot-hint-input used to swallow half of a multi-word answer)
+    const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, .input-answer, #txtAnswer'))
+      .filter(el => !el.closest("#ioe-master-root"));
     const visibleInputs = inputs.filter(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).display !== "none";
@@ -1377,7 +1763,8 @@
       return;
     }
 
-    const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, .input-answer, #txtAnswer'));
+    const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, .input-answer, #txtAnswer'))
+      .filter(el => !el.closest("#ioe-master-root"));
     const visibleInputs = inputs.filter(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).display !== "none";
@@ -1641,7 +2028,8 @@
     st.questions.forEach((q) => {
       const fmt = q.format;
       let kind = "Khác";
-      if (q.isListening) kind = "NGHE True/False";
+      if (q.masked) kind = "NGHE ĐIỀN TỪ (từ bị che ***)";
+      else if (q.isListening) kind = "NGHE True/False";
       else if (fmt === 25) kind = "Ghép cặp (Anh-Việt)";
       else if (q.answers && q.answers.length >= 2) kind = "Trắc nghiệm";
       else if (q.answers && q.answers.length === 1) kind = "Điền từ/1 đáp án";
@@ -1649,6 +2037,7 @@
       lines.push(`Câu ${q.index} [${kind}] (format=${fmt}, type=${q.type}, điểm=${q.point}):`);
       if (q.audio) lines.push(`  - File nghe: ${q.audio}`);
       if (q.prompt) lines.push(`  - Nội dung/Đề: ${q.prompt}`);
+      if (q.masked) lines.push(`  - Từ bị che: "${(q.maskPrefix || "") + "*".repeat(Math.min(q.maskStars || 5, 20))}" (${q.maskStars || "?"} chữ cái ẩn${q.maskPrefix ? `, tiền tố "${q.maskPrefix}"` : ""})`);
       if (q.answers && q.answers.length) {
         q.answers.forEach((a, i) => lines.push(`  - Đáp án [${String.fromCharCode(65 + i)}]: ${a}`));
       }
@@ -1657,12 +2046,12 @@
     });
 
     if (st.answerPool && st.answerPool.length) {
-      lines.push("KHO ĐÁP ÁN GHÉP CẶP (dùng để ghép với nội dung câu):");
+      lines.push("KHO TỪ GỢI Ý (answerPool — cho câu điền từ/ghép cặp):");
       st.answerPool.forEach((a, i) => lines.push(`  [${i + 1}] ${a}`));
       lines.push("");
     }
 
-    lines.push("YÊU CẦU: Dựa vào dữ liệu trên, hãy đưa ra đáp án đúng cho từng câu theo đúng định dạng tag [ANSWER: ...] / [MATCH_PAIRS: ...]. Với câu NGHE True/False, nghe file audio (đính kèm) và so với câu khẳng định để chọn True/False.");
+    lines.push("YÊU CẦU: Dựa vào dữ liệu trên, hãy đưa ra đáp án đúng cho từng câu theo đúng định dạng tag: câu NGHE ĐIỀN TỪ → [FILL_WORDS: 1. từ_1, 2. từ_2, ...]; câu NGHE True/False → [TF_ANSWERS: ...] (nghe file audio đính kèm); câu Trắc nghiệm nhiều câu → [MCQ_ANSWERS: ...]; ghép cặp → [MATCH_PAIRS: ...]; câu đơn → [ANSWER: ...].");
     return lines.join("\n");
   }
 
@@ -1682,6 +2071,7 @@
 
 
     // 1. Check DOM Reading Elements (innerText contains 100% of untruncated story/passage)
+    //    BUG#9: skip OUR OWN panel/pill so the AI never sees extension UI text.
     const domSelectors = [
       '.reading-content', '.passage', '.reading-text', '.text-reading',
       '#contentReading', '.exam-reading', '.box-reading', '.scroll-text',
@@ -1691,6 +2081,7 @@
 
     const domEls = document.querySelectorAll(domSelectors.join(","));
     for (const el of domEls) {
+      if (el.closest && el.closest("#ioe-master-root")) continue;
       const txt = (el.innerText || "").trim();
       if (txt.length >= 60 && !passageParts.includes(txt)) {
         passageParts.push(txt);
@@ -1700,6 +2091,7 @@
     // Check all scrollable DOM elements
     const allDivs = document.querySelectorAll("div, p, section, article");
     for (const d of allDivs) {
+      if (d.closest && d.closest("#ioe-master-root")) continue;
       if (d.scrollHeight > d.clientHeight + 40) {
         const txt = (d.innerText || "").trim();
         if (txt.length >= 80 && !passageParts.includes(txt)) {
@@ -1859,7 +2251,29 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
 
     // Detect multi-question True/False listening exam via game API (each question has its own audio file)
     const apiQuestions = getGameQuestions() || [];
-    const isMultiTfExam = apiQuestions.length > 1 && apiQuestions.every(q => q.isListening && q.audio);
+    const examClass = classifyExam(apiQuestions);
+    // Masked listening exams (fill-word) are NOT True/False — exclude them here so
+    // they take the dedicated fill-word path instead of the TF pipeline (BUG#1).
+    const isMultiTfExam = apiQuestions.length > 1 &&
+      apiQuestions.every(q => q.isListening && q.audio) &&
+      !apiQuestions.every(q => q.masked);
+
+    // Data-driven dispatch: when we already hold the exact API JSON for a
+    // fill-word / multi-MCQ exam, solve it straight from the data (AI + typing /
+    // option clicking) — regardless of which button (F2 / Tự Làm) fired this.
+    if (!useOverride && (examClass === "listening_fillword" || examClass === "mcq_multi")) {
+      isSolving = false;
+      const stE = getGameBridgeStateDirect();
+      const done = examClass === "listening_fillword"
+        ? await solveAndTypeFillWords(apiQuestions, stE)
+        : await solveAndClickMcqMulti(apiQuestions, stE);
+      if (isAutoRunning && done) {
+        showToast("✅ Bot đã làm xong toàn bộ bài này.");
+        stopAutoPilot();
+      }
+      if (callback) callback(!!done, null, false, false, false, false, false);
+      return;
+    }
 
     // Ensure audio is captured and Base64 is 100% ready before sending to AI
     let audioData = null;
@@ -1934,7 +2348,8 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
       audioUrl: activeAudioUrl,
       audioBase64: capturedBase64,
       audioUrls: multiAudioUrls,
-      hint: effectiveHint
+      hint: effectiveHint,
+      examKind: isMultiTfExam ? "tf" : null
     }, (resp) => {
       isSolving = false;
       if (!resp) {
@@ -1950,7 +2365,63 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
         let isMcq = false;
         let isMultiTf = false;
         let bannerHtml = "";
+        lastFillWords = [];
+        lastMcqPicks = [];
 
+        // Multi fill-word: [FILL_WORDS: 1. supposed, 2. meets, ...] → cache & execute via the fill-word pipeline
+        const fillTag = rawAnswer.match(/\[FILL_WORDS:\s*([^\]]+)\]/i);
+        if (fillTag) {
+          const items = parseTagItems(fillTag[1]);
+          lastFillWords = items.map(w => (w == null ? null : String(w).trim().replace(/^["']|["']$/g, "")));
+          // Persist per-question answers so a repeated question is instant next time
+          // (pool-aware key — see qCacheKeyFor, BUG#11)
+          const poolNow = (getGameBridgeStateDirect() || {}).answerPool || [];
+          if (apiQuestions.length && apiQuestions.length === lastFillWords.length) {
+            apiQuestions.forEach((q, i) => {
+              if (lastFillWords[i]) saveQCacheEntry(qCacheKeyFor(q, poolNow), lastFillWords[i]);
+            });
+          }
+          rawAnswer = rawAnswer.replace(/\[FILL_WORDS:\s*[^\]]+\]/i, "").trim();
+          lastAnswerParsed = lastFillWords.map((w, i) => `${i + 1}. ${w || "?"}`).join(", ");
+          const fwChips = lastFillWords.map((w, idx) => `
+            <span class="ioe-slot-chip" data-act="type" data-word="${escapeHtml(w || "")}" style="${w ? "background:#ede9fe; border-color:#7c3aed;" : "background:#fee2e2; border-color:#ef4444;"}cursor:pointer;" title="Click để gõ lại từ này">
+              ${idx + 1}: <strong>${escapeHtml(w || "?")}</strong>
+            </span>
+          `).join("");
+          bannerHtml = `
+            <div class="ioe-ans-banner">
+              <div class="ioe-ans-label"><span>✍️ KẾT QUẢ NGHE ĐIỀN TỪ (${lastFillWords.length} CÂU)</span></div>
+              <div class="ioe-slot-chips">${fwChips}</div>
+            </div>
+          `;
+        } else if (/\[MCQ_ANSWERS:\s*([^\]]+)\]/i.test(rawAnswer)) {
+          // Multi-MCQ: [MCQ_ANSWERS: 1. B, 2. A, ...]
+          const mqTag = rawAnswer.match(/\[MCQ_ANSWERS:\s*([^\]]+)\]/i);
+          const items = parseTagItems(mqTag[1]);
+          lastMcqPicks = items.map(v => {
+            const m = (v == null ? "" : String(v).trim().toUpperCase()).match(/^([A-D])/);
+            return m ? m[1] : null;
+          });
+          const poolNow2 = (getGameBridgeStateDirect() || {}).answerPool || [];
+          if (apiQuestions.length && apiQuestions.length === lastMcqPicks.length) {
+            apiQuestions.forEach((q, i) => {
+              if (lastMcqPicks[i]) saveQCacheEntry(qCacheKeyFor(q, poolNow2), lastMcqPicks[i]);
+            });
+          }
+          rawAnswer = rawAnswer.replace(/\[MCQ_ANSWERS:\s*[^\]]+\]/i, "").trim();
+          lastAnswerParsed = lastMcqPicks.map((v, i) => `${i + 1}. ${v || "?"}`).join(", ");
+          const mqChips = lastMcqPicks.map((v, idx) => `
+            <span class="ioe-slot-chip" style="${v ? "background:#dcfce7; border-color:#10b981;" : "background:#fee2e2; border-color:#ef4444;"}">
+              Câu ${idx + 1}: <strong>${v || "?"}</strong>
+            </span>
+          `).join("");
+          bannerHtml = `
+            <div class="ioe-ans-banner">
+              <div class="ioe-ans-label"><span>🎯 KẾT QUẢ TRẮC NGHIỆM (${lastMcqPicks.length} CÂU)</span></div>
+              <div class="ioe-slot-chips">${mqChips}</div>
+            </div>
+          `;
+        } else {
         // Check for MULTI True/False tag FIRST: [TF_ANSWERS: 1. True, 2. False, ...]
         const tfTag = rawAnswer.match(/\[TF_ANSWERS:\s*([^\]]+)\]/i);
         if (tfTag) {
@@ -2021,7 +2492,7 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
           rawAnswer = rawAnswer.replace(/\[MATCH_PAIRS:\s*[^\]]+\]/i, "").trim();
 
           const pairChips = lastMatchingPairs.map((p, idx) => `
-            <span class="ioe-slot-chip" onclick="clickMatchingPairDirectly(${p[0]}, ${p[1]})" title="Click để tự bấm cặp này">
+            <span class="ioe-slot-chip" data-act="match" data-a="${p[0]}" data-b="${p[1]}" title="Click để tự bấm cặp này" style="cursor:pointer;">
               Cặp ${idx+1}: <strong>Ô ${p[0]} ↔ Ô ${p[1]}</strong>
             </span>
           `).join("");
@@ -2060,7 +2531,7 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
             const optText = mcqCheck[2] ? mcqCheck[2].trim() : "";
             slotChipsHtml = `
               <div class="ioe-slot-chips">
-                <span class="ioe-slot-chip" style="background: #4f46e5; color: #ffffff; border-color: #4338ca; cursor: pointer;" onclick="triggerUniversalAutoFillOrSelect()" title="Click để tự động chọn đáp án này">
+                <span class="ioe-slot-chip" style="background: #4f46e5; color: #ffffff; border-color: #4338ca; cursor: pointer;" data-act="autofill" title="Click để tự động chọn đáp án này">
                   🎯 Tự chọn đáp án: <strong>[${optLetter}]</strong> ${optText ? `(${escapeHtml(optText)})` : ''}
                 </span>
               </div>
@@ -2068,7 +2539,7 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
           } else if (!isTrueFalse && lastAnswerParsed && lastAnswerParsed.includes(" ")) {
             const words = lastAnswerParsed.split(/\s+/);
             const chips = words.map((w, idx) => `
-              <span class="ioe-slot-chip" onclick="navigator.clipboard.writeText('${w}'); alert('Đã copy ô ${idx+1}: ${w}')">
+              <span class="ioe-slot-chip" data-act="copyword" data-w="${escapeHtml(w)}" style="cursor:pointer;" title="Click để copy từ này">
                 Ô ${idx+1}: <strong>${escapeHtml(w)}</strong> (${w.length} ký tự)
               </span>
             `).join("");
@@ -2088,8 +2559,9 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
           }
         }
         }
+        }
 
-        qBox.textContent = isMultiTf ? `🎧 Đã giải xong ${lastTrueFalseAnswers.length} câu True/False — đang tự click...` : (isTrueFalse ? `🎧 Đáp án: ${lastAnswerParsed}` : (isMatching ? "🧩 Đã nhận diện & ghép xong các cặp thẻ!" : (isMcq ? `🎯 Đáp án trắc nghiệm: ${lastAnswerParsed}` : "✅ Đã giải xong câu hỏi!")));
+        qBox.textContent = isMultiTf ? `🎧 Đã giải xong ${lastTrueFalseAnswers.length} câu True/False — đang tự click...` : (lastFillWords.length ? `✍️ Đã có ${lastFillWords.filter(Boolean).length} từ điền — đang tự gõ...` : (lastMcqPicks.length ? `🎯 Đã có ${lastMcqPicks.filter(Boolean).length} đáp án trắc nghiệm — đang tự chọn...` : (isTrueFalse ? `🎧 Đáp án: ${lastAnswerParsed}` : (isMatching ? "🧩 Đã nhận diện & ghép xong các cặp thẻ!" : (isMcq ? `🎯 Đáp án trắc nghiệm: ${lastAnswerParsed}` : "✅ Đã giải xong câu hỏi!")))));
 
         const parsedHtml = (window.marked && window.marked.parse) ? window.marked.parse(rawAnswer) : rawAnswer;
 

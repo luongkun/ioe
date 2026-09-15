@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Mock Trắc Nghiệm Nhiều Câu (Cocos) - IOE Test</title>
+  <style>
+    body { margin: 0; background: #0b1220; font-family: 'Segoe UI', Tahoma, sans-serif; }
+    #GameCanvas { display: block; width: 900px; height: 560px; background: #12325e; margin: 40px auto; border-radius: 12px; }
+    #mock-log { color: #94a3b8; font-size: 12px; max-width: 900px; margin: 0 auto 20px; }
+  </style>
+</head>
+<body oncontextmenu="return false;" onselectstart="return false;">
+  <canvas id="GameCanvas" width="900" height="560"></canvas>
+  <div id="mock-log">Mock game: 3 câu trắc nghiệm (Cocos giả lập). Trạng thái: <span id="mock-state">chưa bắt đầu</span></div>
+  <script>
+    setInterval(() => {
+      const el = document.getElementById("mock-state");
+      if (!el) return;
+      const st = window.MOCK_GAME_STATE || {};
+      el.textContent = st.finished ? "HOÀN THÀNH — " + JSON.stringify(st.submitted)
+        : `started=${!!st.started} current=${st.current}`;
+    }, 400);
+  </script>
+  <script src="mock_cocos_runtime.js"></script>
+  <script>
+    window.MOCK_GAME.init({
+      type: "mcq",
+      questions: [
+        { prompt: "If it rains tomorrow, we _______ our camping trip.", answers: ["will cancel", "would cancel", "cancelled", "cancel"] },
+        { prompt: "She _______ to school by bus every day.", answers: ["go", "goes", "going", "gone"] },
+        { prompt: "They have lived here _______ 2010.", answers: ["since", "for", "from", "at"] }
+      ]
+    });
+  </script>
+</body>
+</html>

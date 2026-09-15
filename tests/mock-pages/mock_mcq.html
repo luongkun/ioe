@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>Mock MCQ - IOE Test</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #eef2f6; margin: 0; padding: 30px; user-select: none; }
+    .exam-container { max-width: 800px; margin: 0 auto; background: #fff; border-radius: 12px; padding: 30px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); }
+    .question-content { font-size: 16px; font-weight: 600; color: #0f172a; margin-bottom: 15px; line-height: 1.5; }
+    .answers { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; list-style: none; padding: 0; margin: 0; }
+    .answer-item { background: #fff; border: 1px solid #cbd5e1; padding: 10px 14px; border-radius: 8px; cursor: pointer; font-weight: 500; }
+    .answer-item.selected { border-color: #10b981; background: #ecfdf5; font-weight: 700; color: #065f46; }
+  </style>
+</head>
+<body oncontextmenu="return false;" onselectstart="return false;">
+  <div class="exam-container">
+    <div class="question-content" id="txtQuestion">Câu 1: If it rains tomorrow, we _______ our camping trip.</div>
+    <ul class="answers">
+      <li class="answer-item" onclick="selectAns(this)">A. will cancel</li>
+      <li class="answer-item" onclick="selectAns(this)">B. would cancel</li>
+      <li class="answer-item" onclick="selectAns(this)">C. cancelled</li>
+      <li class="answer-item" onclick="selectAns(this)">D. cancel</li>
+    </ul>
+  </div>
+  <script>
+    function selectAns(el) {
+      document.querySelectorAll('.answer-item').forEach(i => i.classList.remove('selected'));
+      el.classList.add('selected');
+    }
+  </script>
+</body>
+</html>
