@@ -1,0 +1,99 @@
+{
+  "manifest_version": 3,
+  "name": "English Master AI - Trợ Lý Giải Bài Tiếng Anh & IOE",
+  "version": "2.11.0",
+  "description": "Giải bài tập tiếng Anh thông minh bằng AI: trắc nghiệm, điền từ, ghép cặp, bài nghe True/False trên IOE (ioe.vn) bằng Multimodal AI.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "contextMenus",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "https://generativelanguage.googleapis.com/*",
+    "*://*.ioe.vn/*",
+    "*://ioe.vn/*"
+  ],
+  "background": {
+    "service_worker": "background/service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "lib/marked.min.js",
+        "content/content.js"
+      ],
+      "css": [
+        "content/content.css"
+      ],
+      "run_at": "document_end"
+    },
+    {
+      "matches": [
+        "*://*.ioe.vn/*",
+        "*://ioe.vn/*"
+      ],
+      "js": [
+        "content/ioe/audio-sniffer.js",
+        "content/ioe/slot-inspector.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://*.ioe.vn/*",
+        "*://ioe.vn/*"
+      ],
+      "js": [
+        "content/ioe/game-api-bridge.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://*.ioe.vn/*",
+        "*://ioe.vn/*"
+      ],
+      "js": [
+        "lib/marked.min.js",
+        "content/ioe/overlay-reader.js",
+        "content/ioe/ioe.js"
+      ],
+      "css": [
+        "content/ioe/ioe.css"
+      ],
+      "all_frames": true,
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "English Master AI & IOE",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_page": "options/options.html",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "icons/*",
+        "lib/*",
+        "content/*"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

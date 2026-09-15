@@ -1,0 +1,2167 @@
+/**
+ * English Master AI - Dedicated IOE Universal Game Solver v2.11.0
+ * Supports: True/False Listening (Dọn rác bãi biển), Matching Pairs (Ghép Cặp 12 ô), MCQ (Tái tạo san hô, Fansipan, Leo núi), Long Reading Passage Auto-Scroll & Extraction
+ */
+
+(function () {
+  if (window.__IOE_MASTER_LOADED__) return;
+  window.__IOE_MASTER_LOADED__ = true;
+
+  console.log("%c[English Master AI v2.11.0] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
+
+  // 1. Super Unblocker
+  function superUnblockAll() {
+    ["contextmenu", "selectstart", "copy", "cut", "paste"].forEach(evt => {
+      window.addEventListener(evt, (e) => {
+        e.stopImmediatePropagation();
+      }, true);
+    });
+
+    const style = document.createElement("style");
+    style.id = "ioe-super-unblock-style";
+    style.innerHTML = `
+      body, *, div, p, span, h1, h2, h3, h4, section, article {
+        user-select: text !important;
+        -webkit-user-select: text !important;
+      }
+    `;
+    document.documentElement.appendChild(style);
+  }
+
+  superUnblockAll();
+
+  // 1.5 GAME API BRIDGE (Cocos Creator IOE games) - receives exact exam JSON
+  let gameBridgeState = null;
+
+  window.addEventListener("message", (ev) => {
+    if (ev.source !== window) return;
+    const d = ev.data;
+    if (!d || !d.__ioeBridge) return;
+    if (d.type === "GETINFO" || d.type === "SYNC") {
+      gameBridgeState = d.payload || null;
+      if (gameBridgeState && gameBridgeState.questions) {
+        const n = gameBridgeState.questions.length;
+        console.log(`[English Master AI] 🎮 IOE game API: ${n} câu hỏi (examKey ${gameBridgeState.examKey})`);
+        const badge = document.getElementById("ioe-game-api-badge");
+        if (badge) {
+          badge.textContent = `🎮 API ${n} câu`;
+          badge.classList.remove("hidden");
+        }
+      }
+    } else if (d.type === "ANSWERCHECK") {
+      if (gameBridgeState) gameBridgeState.lastAnswerCheck = d.payload;
+    }
+  });
+
+  function requestGameBridgeSync() {
+    try { window.postMessage({ __ioeBridgeRequest: true, type: "SYNC_STATE" }, window.location.origin); } catch (e) {}
+  }
+
+  function getGameQuestions() {
+    if (gameBridgeState && gameBridgeState.questions && gameBridgeState.questions.length) {
+      return gameBridgeState.questions;
+    }
+    return null;
+  }
+
+  // In-memory fallback: try to read the MAIN-world bridge directly (works if same world)
+  function getGameBridgeStateDirect() {
+    try {
+      if (window.__IOE_GAME_BRIDGE__ && window.__IOE_GAME_BRIDGE__.getState) return window.__IOE_GAME_BRIDGE__.getState();
+    } catch (e) {}
+    return gameBridgeState;
+  }
+
+  // RPC to the MAIN-world Cocos bridge (for clicking nodes on the canvas)
+  function ioeBridgeRequest(type, data, timeoutMs = 8000) {
+    return new Promise((resolve) => {
+      const reqId = "rpc_" + type + "_" + Date.now() + "_" + Math.floor(Math.random() * 1e6);
+      let done = false;
+      const onMsg = (ev) => {
+        const d = ev.data;
+        if (!d || !d.__ioeBridge) return;
+        if (d.reqId !== reqId) return;
+        done = true;
+        window.removeEventListener("message", onMsg);
+        resolve(d);
+      };
+      window.addEventListener("message", onMsg);
+      try { window.postMessage({ __ioeBridgeRequest: true, type, data, reqId }, window.location.origin); } catch (e) { resolve(null); return; }
+      setTimeout(() => { if (!done) { window.removeEventListener("message", onMsg); resolve(null); } }, timeoutMs);
+    });
+  }
+
+  function isCocosGame() {
+    try { return !!(window.__IOE_GAME_BRIDGE__) || !!(gameBridgeState && gameBridgeState.questions && gameBridgeState.questions.length); } catch (e) { return false; }
+  }
+
+  function isImageRef(s) {
+    return typeof s === "string" && /\.(png|jpe?g|gif|webp|bmp)(\?|$)/i.test(s);
+  }
+
+  // Build [ [prompt, answer], ... ] pairs from the exact game JSON (text-only pairs)
+  function deriveMatchPairsFromGameApi() {
+    const qs = getGameQuestions();
+    if (!qs || !qs.length) return [];
+    const pairs = [];
+    for (const q of qs) {
+      const prompt = (q.prompt || "").trim();
+      const ans = (q.answers && q.answers.length) ? String(q.answers[0]).trim() : "";
+      if (!prompt || !ans) continue;
+      if (isImageRef(prompt) || isImageRef(ans)) continue;
+      if (/^https?:\/\//i.test(prompt) || /^https?:\/\//i.test(ans)) continue;
+      pairs.push([prompt, ans]);
+    }
+    return pairs;
+  }
+
+  // Auto-solve a Cocos Creator IOE game using the exact API JSON + canvas node clicks
+  async function autoSolveCocosGame() {
+    createIOEUI();
+    const st = getGameBridgeStateDirect();
+    if (!st || !st.questions || !st.questions.length) {
+      requestGameBridgeSync();
+      await sleep(800);
+    }
+    const st2 = getGameBridgeStateDirect();
+    if (!st2 || !st2.questions || !st2.questions.length) {
+      showToast("⚠️ Chưa bắt được dữ liệu API game. Hãy chờ game tải xong rồi thử lại.");
+      return;
+    }
+
+    const qs = st2.questions;
+    showToast(`🎮 Cocos: đang tự làm ${qs.length} câu từ API game...`);
+
+    // 1. Start the game (close popups, press start)
+    await ioeBridgeRequest("START_GAME", {}, 6000);
+    await sleep(1200);
+
+    // 2. Matching game (format 25, text pairs only)
+    const pairs = deriveMatchPairsFromGameApi();
+    const isMatching = qs.length > 0 && pairs.length > 0 &&
+      qs.every(q => q.format === 25) &&
+      !qs.some(q => (q.answers || []).some(a => isImageRef(String(a))));
+
+    if (isMatching) {
+      const runId = "match_" + Date.now();
+      await ioeBridgeRequest("AUTO_MATCH", { pairs, runId }, 30000 + pairs.length * 3000);
+      showToast(`✅ Cocos: đã tự ghép ${pairs.length} cặp!`);
+      return;
+    }
+
+    // 3. MCQ / fill: click nodes whose text matches each answer
+    const items = [];
+    for (const q of qs) {
+      const ans = (q.tans && q.tans[0]) || (q.answers && q.answers[0]) || "";
+      const txt = String(ans).trim();
+      if (txt && !/^https?:\/\//i.test(txt)) items.push({ text: txt, contains: true, delay: 1400 });
+    }
+    if (items.length) {
+      // The bridge waits for each option node to appear before clicking —
+      // 25s budget per question; report the REAL done/failed result.
+      const seqResp = await ioeBridgeRequest("CLICK_SEQUENCE", { items }, 15000 + items.length * 25000);
+      const seqPayload = seqResp && seqResp.payload;
+      const doneCount = seqPayload && typeof seqPayload.done === "number" ? seqPayload.done : null;
+      if (doneCount !== null && doneCount < items.length) {
+        showToast(`⚠️ Cocos: chỉ click được ${doneCount}/${items.length} đáp án — hãy bấm Giải lại (F2) để AI giải các câu còn lại.`);
+      } else {
+        showToast(`✅ Cocos: đã tự chọn ${items.length} đáp án!`);
+      }
+      return;
+    }
+
+    // 4. Listening True/False: API has no answers — solve ALL questions with AI
+    //    (multi-audio exam) then auto-click each result. No manual F2 needed.
+    showToast("🎧 Bài nghe True/False: đang nhờ AI nghe & giải toàn bộ câu hỏi...");
+    await executeScreenAndAudioSolve("", async (success, answer, hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf) => {
+      if (!success) {
+        showToast("⚠️ AI không giải được bài nghe. Hãy thử lại.");
+        return;
+      }
+      if (isMultiTf && lastTrueFalseAnswers.length > 0) {
+        await executeTrueFalseClicksSequentially();
+      } else if (lastTrueFalseAnswers.length > 0) {
+        await executeTrueFalseClicksSequentially();
+      } else {
+        showToast("⚠️ AI chưa trả về danh sách True/False. Hãy bấm F2 (Giải) rồi thử lại.");
+      }
+    });
+  }
+
+  window.autoSolveCocosGameIOE = autoSolveCocosGame;
+
+  // 2. Audio Tracking
+  let latestAudioUrl = null;
+  let audioDetectTime = 0;
+
+  window.addEventListener("IOE_AUDIO_CAPTURED", (e) => {
+    if (e.detail && e.detail.url) {
+      latestAudioUrl = e.detail.url;
+      audioDetectTime = Date.now();
+      showToast("🎧 Đã bắt được âm thanh câu hỏi nghe!");
+      const audioBadge = document.getElementById("ioe-audio-detected-badge");
+      if (audioBadge) {
+        audioBadge.classList.remove("hidden");
+      }
+    }
+  });
+
+  // 3. UI Elements & States
+  let ioeRootEl = null;
+  let panelEl = null;
+  let lastAnswerParsed = "";
+  let lastMatchingPairs = [];
+  let lastTrueFalseAnswers = [];
+  let isSolving = false;
+  let isDragging = false;
+  let dragOffset = { x: 0, y: 0 };
+
+  // Auto-Pilot state
+  let isAutoRunning = false;
+  let autoTimer = null;
+  let autoCountdownInterval = null;
+
+  function getRandomHumanDelay(minMs, maxMs) {
+    const base = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+    const jitter = Math.floor((Math.random() - 0.5) * 500);
+    return Math.max(minMs, base + jitter);
+  }
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function createIOEUI() {
+    if (document.getElementById("ioe-master-root")) return;
+
+    ioeRootEl = document.createElement("div");
+    ioeRootEl.id = "ioe-master-root";
+
+    ioeRootEl.innerHTML = `
+      <div class="ioe-control-pill" id="ioe-pill-toggle">
+        <div class="ioe-badge-icon">IOE</div>
+        <span class="ioe-pill-title">English Master v2.11.0</span>
+        <span id="ioe-audio-detected-badge" class="ioe-audio-pill hidden" title="Phát hiện bài thi nghe">🎧 Audio</span>
+        <span id="ioe-game-api-badge" class="ioe-api-pill hidden" title="Đã đọc đề trực tiếp từ API game">🎮 API</span>
+        <div class="ioe-pill-btn-group">
+          <button class="ioe-btn-pill ioe-btn-solve" id="ioe-trigger-solve-btn" title="Chụp màn hình & Tự nhận diện dạng bài để giải (F2)">
+            ⚡ Chụp & Giải (F2)
+          </button>
+        </div>
+      </div>
+
+      <div class="ioe-panel hidden" id="ioe-result-panel">
+        <div class="ioe-panel-header" id="ioe-drag-header" title="Giữ chuột tại đây để kéo di chuyển bảng">
+          <div class="ioe-panel-title">
+            <span>🎯 Trợ Lý IOE (True/False • Ghép Cặp • Trắc Nghiệm • Điền Từ)</span>
+            <span class="ioe-drag-indicator">⠿ Kéo</span>
+          </div>
+          <div class="ioe-panel-tools">
+            <button class="ioe-tool-btn" id="ioe-close-panel" title="Đóng">✕</button>
+          </div>
+        </div>
+
+        <!-- Hint / Slot Constraint Bar -->
+        <div class="ioe-hint-bar">
+          <span class="ioe-hint-label">🔢 Tùy chỉnh:</span>
+          <input type="text" id="ioe-slot-hint-input" class="ioe-hint-input" placeholder="Tự động nhận diện dạng bài...">
+          <button id="ioe-re-solve-hint-btn" class="ioe-hint-btn" title="Giải lại">Giải lại</button>
+        </div>
+
+      <div class="ioe-reader-bar">
+          <span class="ioe-reader-label">📖 Đề đọc được:</span>
+          <span id="ioe-reader-stats" class="ioe-reader-stats">chưa đọc</span>
+          <button id="ioe-reader-toggle-btn" class="ioe-reader-btn" title="Mở/đóng khung đọc đề">Xem</button>
+        </div>
+
+        <div class="ioe-reader-box hidden" id="ioe-reader-box">
+          <textarea id="ioe-reader-text" class="ioe-reader-text" placeholder="Nhấn 'Đọc đề' để tự động trích xuất văn bản từ trang, hoặc dán đề bài vào đây..."></textarea>
+          <div class="ioe-reader-actions">
+            <button class="ioe-reader-action" id="ioe-reader-refresh" title="Đọc lại đề từ trang">🔄 Đọc lại</button>
+            <button class="ioe-reader-action" id="ioe-reader-apply" title="Dùng văn bản này làm đề bài cho AI">✅ Dùng làm đề</button>
+          </div>
+        </div>
+
+        <div class="ioe-question-box">
+          <span id="ioe-question-display">Nhấn F2 để chụp & giải, hoặc bật Tự Làm để bot tự chạy...</span>
+        </div>
+
+        <div class="ioe-panel-body" id="ioe-panel-content">
+          <div style="text-align: center; color: #64748b; padding: 20px;">
+            Hỗ trợ <strong>tự động nhận diện 100% dạng bài</strong>:<br/>
+            🎧 Nghe True/False • 🧩 Ghép Cặp • 🎯 Trắc nghiệm 2x2/1x4 • ✏️ Điền từ.
+          </div>
+        </div>
+
+        <div class="ioe-panel-footer">
+          <span>Phím tắt: <strong>F2</strong> (Chụp & Giải) • <strong>F4</strong> (Tự Làm liên tục)</span>
+          <div class="ioe-footer-btn-group">
+            <button class="ioe-btn-action ioe-btn-copy" id="ioe-copy-btn" title="Sao chép đáp án vào clipboard">
+              📋 Copy
+            </button>
+            <button class="ioe-btn-action ioe-btn-auto" id="ioe-auto-btn" title="Tự động 1 nút: AI giải đề (API game + chụp màn hình + nghe audio) rồi tự click/ghép/điền hết — hỗ trợ cả True/False 10 câu, Ghép cặp, Trắc nghiệm, Điền từ">
+              ⚡ Tự Làm
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(ioeRootEl);
+
+    panelEl = ioeRootEl.querySelector("#ioe-result-panel");
+    const pill = ioeRootEl.querySelector("#ioe-pill-toggle");
+    const solveBtn = ioeRootEl.querySelector("#ioe-trigger-solve-btn");
+    const closeBtn = ioeRootEl.querySelector("#ioe-close-panel");
+    const copyBtn = ioeRootEl.querySelector("#ioe-copy-btn");
+    const autoBtn = ioeRootEl.querySelector("#ioe-auto-btn");
+    const reSolveHintBtn = ioeRootEl.querySelector("#ioe-re-solve-hint-btn");
+    const hintInput = ioeRootEl.querySelector("#ioe-slot-hint-input");
+    const dragHeader = ioeRootEl.querySelector("#ioe-drag-header");
+
+    const readerBox = ioeRootEl.querySelector("#ioe-reader-box");
+    const readerText = ioeRootEl.querySelector("#ioe-reader-text");
+    const readerStats = ioeRootEl.querySelector("#ioe-reader-stats");
+    const readerToggleBtn = ioeRootEl.querySelector("#ioe-reader-toggle-btn");
+    const readerRefreshBtn = ioeRootEl.querySelector("#ioe-reader-refresh");
+    const readerApplyBtn = ioeRootEl.querySelector("#ioe-reader-apply");
+
+    readerToggleBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const opening = readerBox.classList.contains("hidden");
+      if (opening) {
+        if (!readerText.value.trim()) runOverlayRead();
+        readerBox.classList.remove("hidden");
+        readerToggleBtn.textContent = "Ẩn";
+      } else {
+        readerBox.classList.add("hidden");
+        readerToggleBtn.textContent = "Xem";
+      }
+    });
+
+    readerRefreshBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      runOverlayRead();
+    });
+
+    readerApplyBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const txt = readerText.value.trim();
+      if (!txt) {
+        showToast("Chưa có văn bản đề để dùng.");
+        return;
+      }
+      executeScreenAndAudioSolve("", null, { textOverride: txt });
+    });
+
+    // Shared post-solve auto-click: after ANY solve path (F2 / Giải lại / hint),
+    // automatically apply the answer — one-button philosophy.
+    const solveAndAutoClick = function (hint) {
+      executeScreenAndAudioSolve(hint, async (success) => {
+        if (!success) return;
+        if (lastMatchingPairs && lastMatchingPairs.length > 0) {
+          await executeMatchingClicksSequentially();
+        } else if (lastTrueFalseAnswers && lastTrueFalseAnswers.length > 0) {
+          await executeTrueFalseClicksSequentially();
+        } else if (lastAnswerParsed) {
+          await triggerUniversalAutoFillOrSelect();
+        }
+      });
+    };
+    window.__IOE_SOLVE_AND_AUTOCLICK__ = solveAndAutoClick;
+
+    solveBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      solveAndAutoClick("");
+    });
+
+    reSolveHintBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      solveAndAutoClick(hintInput.value.trim());
+    });
+
+    hintInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        solveAndAutoClick(hintInput.value.trim());
+      }
+    });
+
+    pill.addEventListener("click", () => {
+      panelEl.classList.toggle("hidden");
+    });
+
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      stopAutoPilot();
+      panelEl.classList.add("hidden");
+    });
+
+    copyBtn.addEventListener("click", () => {
+      if (lastAnswerParsed) {
+        navigator.clipboard.writeText(lastAnswerParsed);
+        showToast(`📋 Đã copy: "${lastAnswerParsed}"`);
+      } else {
+        showToast("Chưa có đáp án để copy.");
+      }
+    });
+
+    autoBtn.addEventListener("click", () => {
+      // Dual-purpose: while F4 auto-pilot is running, clicking stops it; otherwise one-click solve
+      if (isAutoRunning) {
+        stopAutoPilot();
+        return;
+      }
+      oneClickSolveAll();
+    });
+
+    dragHeader.addEventListener("mousedown", (e) => {
+      if (e.target.closest(".ioe-panel-tools")) return;
+      isDragging = true;
+      const rect = panelEl.getBoundingClientRect();
+      dragOffset.x = e.clientX - rect.left;
+      dragOffset.y = e.clientY - rect.top;
+      e.preventDefault();
+    });
+  }
+
+  // Draggable Mousemove
+  document.addEventListener("mousemove", (e) => {
+    if (!isDragging || !panelEl) return;
+    const winWidth = window.innerWidth;
+    const winHeight = window.innerHeight;
+    const panelWidth = panelEl.offsetWidth || 440;
+    const panelHeight = panelEl.offsetHeight || 400;
+
+    let newX = e.clientX - dragOffset.x;
+    let newY = e.clientY - dragOffset.y;
+
+    newX = Math.max(10, Math.min(winWidth - panelWidth - 10, newX));
+    newY = Math.max(10, Math.min(winHeight - panelHeight - 10, newY));
+
+    panelEl.style.left = `${newX}px`;
+    panelEl.style.top = `${newY}px`;
+    panelEl.style.right = "auto";
+  });
+
+  document.addEventListener("mouseup", () => {
+    isDragging = false;
+  });
+
+  // 4. ONE-CLICK "TỰ LÀM" — merged button: detect type & do everything automatically
+  //    Priority: Cocos API exact-data games (matching/MCQ) → AI solve (screenshots + audio,
+  //    including multi-question True/False) → auto click/fill results.
+  async function oneClickSolveAll() {
+    createIOEUI();
+    panelEl.classList.remove("hidden");
+
+    const btn = ioeRootEl?.querySelector("#ioe-auto-btn");
+    if (btn) {
+      btn.disabled = true;
+      btn.style.opacity = "0.7";
+    }
+
+    try {
+      // A. Cocos game with exact API data (matching pairs / MCQ / fill): use it — no AI needed
+      if (isCocosGame()) {
+        const st = getGameBridgeStateDirect();
+        if (!st || !st.questions || !st.questions.length) {
+          requestGameBridgeSync();
+          await sleep(800);
+        }
+        const st2 = getGameBridgeStateDirect();
+        if (st2 && st2.questions && st2.questions.length) {
+          const qs = st2.questions;
+
+          // A1. Matching (format 25, text pairs)
+          const pairs = deriveMatchPairsFromGameApi();
+          const isMatchingGame = pairs.length > 0 && qs.every(q => q.format === 25);
+          if (isMatchingGame) {
+            await ioeBridgeRequest("START_GAME", {}, 6000);
+            await sleep(1200);
+            await ioeBridgeRequest("AUTO_MATCH", { pairs, runId: "match_" + Date.now() }, 30000 + pairs.length * 3000);
+            showToast(`✅ Cocos: đã tự ghép ${pairs.length} cặp!`);
+            return;
+          }
+
+          // A2. MCQ / fill: API already contains answers
+          const items = [];
+          for (const q of qs) {
+            const ans = (q.tans && q.tans[0]) || (q.answers && q.answers[0]) || "";
+            const txt = String(ans).trim();
+            if (txt && !/^https?:\/\//i.test(txt)) items.push({ text: txt, contains: true, delay: 1400 });
+          }
+          if (items.length) {
+            await ioeBridgeRequest("START_GAME", {}, 6000);
+            await sleep(1200);
+            // The bridge now waits for EACH option node to appear on screen
+            // (game reveals questions one-by-one) — allow 25s per question.
+            const seqResp = await ioeBridgeRequest("CLICK_SEQUENCE", { items }, 15000 + items.length * 25000);
+            const seqPayload = seqResp && seqResp.payload;
+            const doneCount = seqPayload && typeof seqPayload.done === "number" ? seqPayload.done : null;
+            if (doneCount !== null && doneCount < items.length) {
+              showToast(`⚠️ Cocos: chỉ click được ${doneCount}/${items.length} đáp án — đang nhờ AI giải lại các câu còn lại...`);
+              // Fall through to AI solve instead of silently failing
+            } else {
+              showToast(`✅ Cocos: đã tự chọn ${items.length} đáp án!`);
+              return;
+            }
+          }
+
+          // A3. Listening True/False (API has no answers): fall through to AI below
+        }
+      }
+
+      // B. AI solve: screenshots + extracted text + audio (single or multi-question T/F)
+      //    then auto-click/fill the results — no manual F2 needed.
+    // Auto-click after solve is normally reserved for the one-click "Tự Làm" flow.
+    // Pass opt.noAutoClick=true for the plain F2/Chụp & Giải path when the user
+    // wants to review the answer first.
+    await executeScreenAndAudioSolve("", async (success, answer, hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf) => {
+      if (!success) {
+        showToast("⚠️ AI không giải được. Hãy thử lại.");
+        return;
+      }
+
+      // Matching: click pairs sequentially
+      if (isMatching && lastMatchingPairs.length > 0) {
+        await executeMatchingClicksSequentially();
+        return;
+        }
+
+        // Multi-question True/False: click all N answers sequentially
+        if (lastTrueFalseAnswers && lastTrueFalseAnswers.length > 0) {
+          await executeTrueFalseClicksSequentially();
+          return;
+        }
+
+        // Single True/False / MCQ / fill: click or fill the single answer
+        if (lastAnswerParsed) {
+          await triggerUniversalAutoFillOrSelect();
+          return;
+        }
+
+        showToast("⚠️ Không có đáp án để tự điền. Hãy kiểm tra kết quả AI trong bảng.");
+      });
+    } finally {
+      const btn2 = ioeRootEl?.querySelector("#ioe-auto-btn");
+      if (btn2) {
+        btn2.disabled = false;
+        btn2.style.opacity = "1";
+      }
+    }
+  }
+
+  window.oneClickSolveAllIOE = oneClickSolveAll;
+
+  // 4. AUTO-PILOT ENGINE WITH GAME-AWARE ANIMATION TIMING
+  function toggleAutoPilot() {
+    if (isAutoRunning) {
+      stopAutoPilot();
+    } else {
+      startAutoPilot();
+    }
+  }
+
+  function startAutoPilot() {
+    createIOEUI();
+    panelEl.classList.remove("hidden");
+    isAutoRunning = true;
+
+    const autoBtn = ioeRootEl.querySelector("#ioe-auto-btn");
+    if (autoBtn) {
+      autoBtn.classList.add("running");
+      autoBtn.innerHTML = "⏹️ Dừng Lại (Stop)";
+    }
+
+    showToast("🚀 Đã BẬT Tự Làm liên tục (F4) — mô phỏng tốc độ người thật!");
+    runAutoPilotStep();
+  }
+
+  function stopAutoPilot() {
+    isAutoRunning = false;
+    if (autoTimer) {
+      clearTimeout(autoTimer);
+      autoTimer = null;
+    }
+    if (autoCountdownInterval) {
+      clearInterval(autoCountdownInterval);
+      autoCountdownInterval = null;
+    }
+
+    const autoBtn = ioeRootEl?.querySelector("#ioe-auto-btn");
+    if (autoBtn) {
+      autoBtn.classList.remove("running");
+      autoBtn.innerHTML = "⚡ Tự Làm";
+    }
+
+    const qBox = ioeRootEl?.querySelector("#ioe-question-display");
+    if (qBox) {
+      qBox.textContent = "⏹️ Đã dừng chế độ Tự Làm.";
+    }
+    showToast("⏹️ Đã dừng chế độ Tự Làm.");
+  }
+
+  // 4.1 Deterministic Question State Snapshot
+  function getCurrentQuestionSnapshot() {
+    const audioUrl = window.__LAST_CAPTURED_IOE_AUDIO__?.url || latestAudioUrl || null;
+    const audioTimestamp = window.__LAST_CAPTURED_IOE_AUDIO__?.timestamp || audioDetectTime || 0;
+
+    let domText = "";
+    const domQ = document.querySelector("#txtQuestion, .question-title, .title-question, .question-content, #contentQuestion, [class*='question']");
+    if (domQ) domText = domQ.innerText.trim();
+
+    let qNum = "";
+    const numEl = document.querySelector(".question-number, .badge-question, .current-question, [class*='number']");
+    if (numEl) qNum = numEl.innerText.trim();
+
+    let memKey = "";
+    if (window.__IOE_SLOT_INSPECTOR__) {
+      const mem = window.__IOE_SLOT_INSPECTOR__.inspectGameMemory();
+      if (mem && mem.data) {
+        try { memKey = JSON.stringify(mem.data).slice(0, 100); } catch (e) {}
+      }
+    }
+
+    return {
+      audioUrl,
+      audioTimestamp,
+      domText,
+      qNum,
+      memKey,
+      capturedAt: Date.now()
+    };
+  }
+
+  // 4.2 Fast Dynamic Question Transition Watcher
+  async function waitForNextQuestionTransition(previousSnapshot, isTrueFalse = false) {
+    const qBox = ioeRootEl?.querySelector("#ioe-question-display");
+    if (qBox) {
+      qBox.textContent = "⏳ Đang chuyển sang câu hỏi mới...";
+    }
+
+    const startTime = Date.now();
+    const minWaitTime = isTrueFalse ? 2600 : 2200;
+    const maxTimeout = 10000;
+
+    while (isAutoRunning) {
+      const elapsed = Date.now() - startTime;
+      if (elapsed > maxTimeout) {
+        break;
+      }
+
+      // 1. Immediate wakeup when new audio is intercepted and ready
+      const currentAudio = window.__LAST_CAPTURED_IOE_AUDIO__;
+      if (currentAudio && currentAudio.isReady && currentAudio.timestamp > previousSnapshot.capturedAt) {
+        console.log("[English Master AI] 🎯 New Audio Ready! Immediate transition.");
+        if (qBox) qBox.textContent = "🎯 Đã có audio câu mới! Đang giải...";
+        await sleep(200);
+        return true;
+      }
+
+      // 2. DOM / Memory Change
+      const currentSnapshot = getCurrentQuestionSnapshot();
+      if (currentSnapshot.domText && previousSnapshot.domText && currentSnapshot.domText !== previousSnapshot.domText) {
+        console.log("[English Master AI] 🎯 DOM Question Text Changed!");
+        await sleep(200);
+        return true;
+      }
+
+      if (currentSnapshot.qNum && previousSnapshot.qNum && currentSnapshot.qNum !== previousSnapshot.qNum) {
+        console.log("[English Master AI] 🎯 Question Number Changed!");
+        await sleep(200);
+        return true;
+      }
+
+      if (currentSnapshot.memKey && previousSnapshot.memKey && currentSnapshot.memKey !== previousSnapshot.memKey) {
+        console.log("[English Master AI] 🎯 Game Memory Question Changed!");
+        await sleep(200);
+        return true;
+      }
+
+      // 3. For True/False: if animation finished (~2.8s) and audio hasn't auto-played, click Play once
+      if (isTrueFalse && elapsed >= 2800 && elapsed <= 3100) {
+        const canvas = findGameCanvas();
+        if (canvas) {
+          const rect = canvas.getBoundingClientRect();
+          const playBtnX = rect.left + (rect.width * 0.165);
+          const playBtnY = rect.top + (rect.height * 0.315);
+          simulateClick(canvas, playBtnX, playBtnY);
+        }
+      }
+
+      // 4. Safe threshold
+      if (isTrueFalse && elapsed >= 3800) {
+        await sleep(200);
+        return true;
+      }
+
+      if (!isTrueFalse && elapsed >= minWaitTime) {
+        await sleep(200);
+        return true;
+      }
+
+      await sleep(150);
+    }
+    return false;
+  }
+
+  // 4.3 Main Auto-Pilot Step Execution
+  async function runAutoPilotStep() {
+    if (!isAutoRunning) return;
+
+    // Record baseline snapshot before solving
+    const previousSnapshot = getCurrentQuestionSnapshot();
+
+    executeScreenAndAudioSolve("", async (success, answer, hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf) => {
+      if (!isAutoRunning) return;
+
+      if (!success) {
+        showToast("⚠️ Không giải được câu này, thử lại sau 2s...");
+        await sleep(2000);
+        if (isAutoRunning) runAutoPilotStep();
+        return;
+      }
+
+      // A0. Multi-question True/False: AI already answered ALL questions at once —
+      //     click them sequentially, then the exam is done (no next-question loop needed).
+      if (isMultiTf && lastTrueFalseAnswers && lastTrueFalseAnswers.length > 0) {
+        await executeTrueFalseClicksSequentially();
+        if (!isAutoRunning) return;
+        if (window.invalidateIOEAudio) window.invalidateIOEAudio();
+        await sleep(1500);
+        if (isAutoRunning) runAutoPilotStep();
+        return;
+      }
+
+      // A. If Matching Game: execute paired clicks
+      if (isMatching && lastMatchingPairs.length > 0) {
+        await executeMatchingClicksSequentially();
+        if (!isAutoRunning) return;
+        if (window.invalidateIOEAudio) window.invalidateIOEAudio();
+        await waitForNextQuestionTransition(previousSnapshot, false);
+        if (isAutoRunning) runAutoPilotStep();
+        return;
+      }
+
+      // B. If True/False Listening Game: rapid natural click (0.3s - 0.6s)
+      if (isTrueFalse) {
+        const reactionDelay = getRandomHumanDelay(300, 600);
+        const qBox = ioeRootEl?.querySelector("#ioe-question-display");
+        if (qBox) {
+          qBox.textContent = `⚡ Đang chọn đáp án...`;
+        }
+        await sleep(reactionDelay);
+        if (!isAutoRunning) return;
+
+        triggerUniversalAutoFillOrSelect();
+
+        // Completely invalidate previous question audio
+        if (window.invalidateIOEAudio) {
+          window.invalidateIOEAudio();
+        }
+
+        // Wait deterministically for new question
+        await waitForNextQuestionTransition(previousSnapshot, true);
+        if (isAutoRunning) runAutoPilotStep();
+        return;
+      }
+
+      // C. If Multiple Choice (MCQ - Tái tạo san hô, Fansipan, Leo núi)
+      if (isMcq) {
+        const reactionDelay = getRandomHumanDelay(350, 700);
+        const qBox = ioeRootEl?.querySelector("#ioe-question-display");
+        if (qBox) {
+          qBox.textContent = `🎯 Đang tự chọn đáp án trắc nghiệm...`;
+        }
+        await sleep(reactionDelay);
+        if (!isAutoRunning) return;
+
+        triggerUniversalAutoFillOrSelect();
+
+        if (window.invalidateIOEAudio) {
+          window.invalidateIOEAudio();
+        }
+
+        await waitForNextQuestionTransition(previousSnapshot, false);
+        if (isAutoRunning) runAutoPilotStep();
+        return;
+      }
+
+      // D. Normal Fill Text Question flow
+      const reactionDelay = getRandomHumanDelay(400, 800);
+      const qBox = ioeRootEl?.querySelector("#ioe-question-display");
+      if (qBox) {
+        qBox.textContent = `🧠 Đang điền đáp án...`;
+      }
+      await sleep(reactionDelay);
+      if (!isAutoRunning) return;
+
+      await triggerHumanizedAutoFillOrSelect(answer);
+      if (!isAutoRunning) return;
+
+      const reviewDelay = getRandomHumanDelay(300, 600);
+      await sleep(reviewDelay);
+      if (!isAutoRunning) return;
+
+      triggerSubmitButton();
+
+      if (window.invalidateIOEAudio) {
+        window.invalidateIOEAudio();
+      }
+
+      // Wait deterministically for next question
+      await waitForNextQuestionTransition(previousSnapshot, false);
+      if (isAutoRunning) runAutoPilotStep();
+    });
+  }
+
+  // 5. MATCHING PAIRS AUTO-CLICKER (3x4 Grid on Canvas & DOM)
+  async function executeMatchingClicksSequentially() {
+    // Preferred path: Cocos Creator game — use exact API pairs and click real nodes
+    const cocosPairs = deriveMatchPairsFromGameApi();
+    if (isCocosGame() && cocosPairs.length > 0) {
+      showToast(`🧩 Cocos: tự ghép ${cocosPairs.length} cặp từ API game...`);
+      const started = await ioeBridgeRequest("START_GAME", {});
+      await sleep(1200);
+      const resp = await ioeBridgeRequest("AUTO_MATCH", { pairs: cocosPairs, runId: "match_" + Date.now() }, 30000);
+      await sleep(1500);
+      showToast(`✅ Đã tự động ghép ${cocosPairs.length} cặp (Cocos)!`);
+      return;
+    }
+
+    if (!lastMatchingPairs || lastMatchingPairs.length === 0) {
+      showToast("Chưa có danh sách cặp để ghép.");
+      return;
+    }
+
+    const canvas = document.querySelector("canvas");
+    showToast(`🧩 Đang tự động ghép ${lastMatchingPairs.length} cặp...`);
+
+    for (let i = 0; i < lastMatchingPairs.length; i++) {
+      if (!isAutoRunning && !panelEl) break;
+
+      const pair = lastMatchingPairs[i];
+      const cellA = parseInt(pair[0]);
+      const cellB = parseInt(pair[1]);
+
+      if (cellA >= 1 && cellA <= 12 && cellB >= 1 && cellB <= 12) {
+        clickMatchingCell(cellA, canvas);
+        await sleep(getRandomHumanDelay(350, 550));
+
+        clickMatchingCell(cellB, canvas);
+        await sleep(getRandomHumanDelay(750, 1100));
+      }
+    }
+
+    showToast("✅ Đã tự động ghép xong tất cả các cặp!");
+  }
+
+  function clickMatchingCell(cellNumber, canvas = null) {
+    if (!canvas) canvas = document.querySelector("canvas");
+
+    const domCards = document.querySelectorAll(".card, .item-card, .card-item, [class*='card']");
+    if (domCards && domCards.length >= 12 && domCards[cellNumber - 1]) {
+      domCards[cellNumber - 1].click();
+      return;
+    }
+
+    if (canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const width = rect.width;
+      const height = rect.height;
+
+      const zeroIndex = cellNumber - 1;
+      const row = Math.floor(zeroIndex / 4);
+      const col = zeroIndex % 4;
+
+      const colXPercentages = [0.24, 0.39, 0.54, 0.69];
+      const rowYPercentages = [0.36, 0.58, 0.80];
+
+      const targetX = rect.left + (width * colXPercentages[col]);
+      const targetY = rect.top + (height * rowYPercentages[row]);
+
+      simulateClick(canvas, targetX, targetY);
+    }
+  }
+
+  // 5.5 UNIVERSAL MULTIPLE CHOICE CLICKER (DOM + Stage Tree + 2x2 / 1x4 / 4x1 Geometries)
+  function clickMultipleChoiceOption(choiceLetter, choiceText = "", canvas = null) {
+    if (!choiceLetter) return false;
+    const letter = choiceLetter.toUpperCase().trim();
+    const letterIdx = letter.charCodeAt(0) - 65; // 0 for A, 1 for B, 2 for C, 3 for D
+    if (letterIdx < 0 || letterIdx > 3) return false;
+
+    if (!canvas) canvas = findGameCanvas();
+
+    // 1. DOM Elements Check
+    const domSelectors = [
+      '.answer-item', '.btn-answer', '.item-answer', 'ul.answers li',
+      'button[class*="ans"]', '[class*="choice"]', '[class*="option"]',
+      'input[type="radio"]', '.radio-answer', '.list-answer li'
+    ];
+    const domElements = Array.from(document.querySelectorAll(domSelectors.join(","))).filter(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).display !== "none";
+    });
+
+    if (domElements.length >= 2) {
+      for (let i = 0; i < domElements.length; i++) {
+        const el = domElements[i];
+        const txt = el.innerText ? el.innerText.trim().toUpperCase() : "";
+        const val = (el.value || el.getAttribute("data-answer") || el.getAttribute("data-value") || "").toUpperCase();
+
+        if (
+          txt.startsWith(letter + ".") ||
+          txt.startsWith(letter + " ") ||
+          txt === letter ||
+          val === letter ||
+          (i === letterIdx && domElements.length === 4) ||
+          (choiceText && txt.includes(choiceText.toUpperCase()))
+        ) {
+          el.focus();
+          el.click();
+          el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          console.log(`[English Master AI] 🎯 Clicked DOM MCQ Option: ${letter}`);
+          return true;
+        }
+      }
+    }
+
+    if (!canvas) return false;
+    const rect = canvas.getBoundingClientRect();
+    const width = rect.width;
+    const height = rect.height;
+
+    // 2. CreateJS / EaselJS DisplayObject Tree Traversal
+    const win = canvas.ownerDocument?.defaultView || window;
+    const stage = win.stage || win.exportRoot?.stage || (win.createjs && win.createjs.Stage?._stages?.[0]);
+
+    if (stage) {
+      try {
+        let foundStageObj = null;
+
+        function walkStageTree(obj) {
+          if (!obj || foundStageObj) return;
+
+          // Check object name (e.g. btn_a, btnA, ans_0, choiceA, itemA)
+          const name = (obj.name || "").toLowerCase();
+          const targetNamePatterns = [
+            `btn_${letter.toLowerCase()}`, `btn${letter.toLowerCase()}`,
+            `choice_${letter.toLowerCase()}`, `choice${letter.toLowerCase()}`,
+            `ans_${letter.toLowerCase()}`, `ans${letter.toLowerCase()}`,
+            `opt_${letter.toLowerCase()}`, `opt${letter.toLowerCase()}`,
+            `btn_${letterIdx}`, `btn${letterIdx + 1}`, `ans_${letterIdx}`, `choice_${letterIdx}`
+          ];
+
+          if (name && targetNamePatterns.some(p => name.includes(p))) {
+            foundStageObj = obj;
+            return;
+          }
+
+          // Check text property
+          if (obj.text && typeof obj.text === "string") {
+            const t = obj.text.trim().toUpperCase();
+            if (t.startsWith(letter + ".") || t.startsWith(letter + " ") || t === letter || (choiceText && t.includes(choiceText.toUpperCase()))) {
+              foundStageObj = obj.parent || obj;
+              return;
+            }
+          }
+
+          if (obj.children && Array.isArray(obj.children)) {
+            for (const child of obj.children) {
+              walkStageTree(child);
+              if (foundStageObj) return;
+            }
+          }
+        }
+
+        walkStageTree(stage);
+
+        if (foundStageObj) {
+          const pt = foundStageObj.localToGlobal(0, 0);
+          const bounds = foundStageObj.getBounds ? (foundStageObj.getBounds() || foundStageObj.nominalBounds) : null;
+          const stageScaleX = stage.scaleX || 1;
+          const stageScaleY = stage.scaleY || 1;
+
+          let targetStageX = pt.x;
+          let targetStageY = pt.y;
+
+          if (bounds) {
+            targetStageX += (bounds.width * (foundStageObj.scaleX || 1)) / 2;
+            targetStageY += (bounds.height * (foundStageObj.scaleY || 1)) / 2;
+          }
+
+          const clientX = rect.left + (targetStageX * stageScaleX);
+          const clientY = rect.top + (targetStageY * stageScaleY);
+
+          simulateClick(canvas, clientX, clientY);
+          setTimeout(() => simulateClick(canvas, clientX, clientY), 60);
+          console.log(`[English Master AI] 🎯 Clicked Stage Object for MCQ Option ${letter} at (${Math.round(clientX)}, ${Math.round(clientY)})`);
+          return true;
+        }
+      } catch (err) {
+        console.warn("[English Master AI] Stage tree walk error:", err);
+      }
+    }
+
+    // 3. Adaptive Coordinate Matrix Engine
+    const url = window.location.href.toLowerCase();
+    const isFansipan = url.includes("fansipan");
+    const isLeoNui = url.includes("leo-nui") || url.includes("vuot-chuong-ngai-vat");
+    const isSanHo = url.includes("tai-tao-san-ho") || url.includes("san-ho") || url.includes("coral");
+
+    let relX = 0.5;
+    let relY = 0.5;
+
+    if (isFansipan) {
+      // 1x4 Horizontal Row (Fansipan)
+      const fansipanX = [0.140, 0.380, 0.620, 0.860];
+      relX = fansipanX[letterIdx];
+      relY = 0.880;
+    } else if (isLeoNui) {
+      // 4x1 Vertical Column (Leo núi)
+      const leoNuiY = [0.460, 0.580, 0.700, 0.820];
+      relX = 0.500;
+      relY = leoNuiY[letterIdx];
+    } else {
+      // Default: 2x2 Grid (Tái tạo san hô / San hô / Điền khuyết 4 lựa chọn)
+      // A (Top-Left): X=22.5%, Y=32.0%
+      // B (Top-Right): X=50.5%, Y=32.0%
+      // C (Bottom-Left): X=22.5%, Y=46.0%
+      // D (Bottom-Right): X=50.5%, Y=46.0%
+      const grid2x2 = [
+        { x: 0.225, y: 0.320 }, // A
+        { x: 0.505, y: 0.320 }, // B
+        { x: 0.225, y: 0.460 }, // C
+        { x: 0.505, y: 0.460 }  // D
+      ];
+      relX = grid2x2[letterIdx].x;
+      relY = grid2x2[letterIdx].y;
+    }
+
+    const primaryX = rect.left + (width * relX);
+    const primaryY = rect.top + (height * relY);
+
+    // Micro-cluster clicks: center of button and circle offset
+    simulateClick(canvas, primaryX, primaryY);
+    setTimeout(() => {
+      simulateClick(canvas, primaryX, primaryY);
+    }, 60);
+
+    console.log(`[English Master AI] 🎯 Clicked Matrix MCQ Option ${letter} at (${Math.round(primaryX)}, ${Math.round(primaryY)})`);
+    return true;
+  }
+
+  // 6. UNIVERSAL AUTO-FILL & AUTO-SELECT (True/False • MCQ • Fill Inputs)
+  // Cocos Creator answering: click real canvas nodes via the MAIN-world bridge
+  async function cocosAutoAnswer(answer) {
+    const clean = (answer || "").trim();
+    const lower = clean.toLowerCase();
+    if (!clean) return false;
+
+    // Ensure game started (close intro popups / press start) if still on StartScene
+    await ioeBridgeRequest("START_GAME", {});
+    await sleep(400);
+
+    // A. True / False
+    if (lower === "true" || lower === "false" || lower.startsWith("true") || lower.startsWith("false")) {
+      const isTrue = lower.startsWith("true");
+      const resp = await ioeBridgeRequest("CLICK_NAME", { name: isTrue ? "btnTrue" : "btnFalse" });
+      if (resp && resp.payload && resp.payload.ok) {
+        showToast(`✅ Cocos: đã chọn [${isTrue ? "True" : "False"}]!`);
+        return true;
+      }
+      return false;
+    }
+
+    // B. Multiple choice: [ANSWER: A. word] -> click node whose text is the word, or btnA
+    const mcq = clean.match(/^([A-D])(?:[\.\s]+)(.*)$/i);
+    if (mcq) {
+      const letter = mcq[1].toUpperCase();
+      const text = (mcq[2] || "").trim();
+      let resp = null;
+      if (text) resp = await ioeBridgeRequest("CLICK_TEXT", { text, contains: true });
+      if (!resp || !resp.payload || !resp.payload.ok) {
+        const names = [`btn${letter}`, `btn_${letter.toLowerCase()}`, `ans${letter}`, `choice${letter}`];
+        for (const nm of names) {
+          resp = await ioeBridgeRequest("CLICK_NAME", { name: nm });
+          if (resp && resp.payload && resp.payload.ok) break;
+        }
+      }
+      if (resp && resp.payload && resp.payload.ok) {
+        showToast(`✅ Cocos: đã chọn đáp án [${letter}] ${text ? `(${text})` : ""}!`);
+        return true;
+      }
+      return false;
+    }
+
+    // C. Fill / short text: try clicking a node whose text equals the answer
+    const resp = await ioeBridgeRequest("CLICK_TEXT", { text: clean, contains: true });
+    if (resp && resp.payload && resp.payload.ok) {
+      showToast(`✅ Cocos: đã chọn "${clean}"!`);
+      return true;
+    }
+    return false;
+  }
+
+  // Ask the MAIN-world bridge what question is currently rendered on the canvas.
+  // Returns { text, qnum } — only ACTIVE nodes are considered by the bridge.
+  async function getCurrentTfQuestionInfo() {
+    const resp = await ioeBridgeRequest("CURRENT_QUESTION", {}, 5000);
+    if (resp && resp.payload) return resp.payload;
+    return { text: "", qnum: null };
+  }
+
+  // Wait until the game has FINISHED animating to the NEXT question:
+  // - the on-screen question number increases (or question text changes), AND
+  // - a minimum animation window has elapsed (Cocos TF transition ≈ 2.8s).
+  // Returns unreadable:true when neither counter nor text can be read — the
+  // caller must then fall back to a fixed safe wait instead of clicking blind.
+  async function waitForTfNextQuestion(prevInfo, timeoutMs = 12000) {
+    const prevQnum = prevInfo ? prevInfo.qnum : null;
+    const prevText = (prevInfo && prevInfo.text) || "";
+    const canDetect = (prevQnum !== null && prevQnum !== undefined) || !!prevText;
+    if (!canDetect) {
+      return { ok: false, unreadable: true, info: prevInfo };
+    }
+
+    const MIN_ANIM_MS = 4200;
+    const start = Date.now();
+    let lastInfo = { qnum: null, text: "" };
+
+    while (Date.now() - start < timeoutMs) {
+      const info = await getCurrentTfQuestionInfo();
+      lastInfo = info;
+
+      const animDone = Date.now() - start >= MIN_ANIM_MS;
+      const qnumAdvanced = animDone && info.qnum !== null && prevQnum !== null && info.qnum > prevQnum;
+      const textChanged = animDone && info.text && prevText && info.text !== prevText;
+
+      if (qnumAdvanced || textChanged) {
+        // Label is on screen, but the card/animation may still be settling —
+        // give it a full beat so the answer button is completely interactive.
+        await sleep(1000);
+        return { ok: true, info };
+      }
+      await sleep(200);
+    }
+    return { ok: false, info: lastInfo };
+  }
+
+  // 6.1 MULTI True/False SEQUENTIAL CLICKER (AI answered all N listening questions)
+  // Clicks True/False on each question one-by-one via the MAIN-world Cocos bridge,
+  // then waits for the game to advance to the next question before clicking again.
+  async function executeTrueFalseClicksSequentially() {
+    if (!lastTrueFalseAnswers || lastTrueFalseAnswers.length === 0) {
+      showToast("Chưa có danh sách đáp án True/False.");
+      return false;
+    }
+
+    showToast(`🎧 Đang tự chọn ${lastTrueFalseAnswers.length} câu True/False...`);
+
+    // Only start the game if it hasn't started yet (start_btn is inactive after start,
+    // so the bridge's findNodeByName simply won't find it → safe no-op).
+    await ioeBridgeRequest("START_GAME", {}, 6000);
+
+    // Wait until question 1 is fully rendered on screen (intro animation ≈ 2.8s).
+    let lastQinfo = { qnum: null, text: "" };
+    {
+      const start = Date.now();
+      while (Date.now() - start < 10000) {
+        const info = await getCurrentTfQuestionInfo();
+        const ready = (info.qnum !== null && info.qnum >= 1) || (info.text && info.text.length >= 15);
+        if (ready) { lastQinfo = info; break; }
+        await sleep(300);
+      }
+      if (!lastQinfo.text && lastQinfo.qnum === null) {
+        // Couldn't read the screen — fall back to a generous fixed wait so we
+        // still don't click during the intro animation.
+        await sleep(4200);
+        lastQinfo = await getCurrentTfQuestionInfo();
+      } else {
+        await sleep(1000); // settle beat after the question is visible
+      }
+    }
+
+    let clicked = 0;
+    let skippedNoAdvance = 0;
+
+    for (let i = 0; i < lastTrueFalseAnswers.length; i++) {
+      const val = lastTrueFalseAnswers[i];
+      if (val === null || val === undefined) {
+        console.warn(`[English Master AI] ⚠️ Câu ${i + 1}: AI không trả lời — bỏ qua.`);
+        continue;
+      }
+
+      // (Question-readiness is handled AFTER each click below — after an answer is
+      // chosen the game always animates to the next question, and we block until
+      // that animation completes. The pre-click state was captured in lastQinfo.)
+
+      const nodeName = val ? "btnTrue" : "btnFalse";
+      const resp = await ioeBridgeRequest("CLICK_NAME", { name: nodeName }, 8000);
+      const ok = !!(resp && resp.payload && resp.payload.ok);
+      if (ok) {
+        clicked++;
+        showToast(`✅ Câu ${i + 1}/${lastTrueFalseAnswers.length}: đã chọn [${val ? "True" : "False"}]`);
+      } else {
+        // Fallback: percentage coordinates on canvas (btnTrue ~75.8%/17.5%, btnFalse ~75.2%/28.9%)
+        const canvas = findGameCanvas();
+        if (canvas) {
+          const rect = canvas.getBoundingClientRect();
+          const targetX = rect.left + (rect.width * (val ? 0.758 : 0.752));
+          const targetY = rect.top + (rect.height * (val ? 0.175 : 0.289));
+          simulateClick(canvas, targetX, targetY);
+          clicked++;
+          showToast(`✅ Câu ${i + 1}/${lastTrueFalseAnswers.length}: [${val ? "True" : "False"}] (canvas)`);
+        }
+      }
+
+      // ===== WAIT FOR THE GAME TO ADVANCE TO THE NEXT QUESTION (ALWAYS, no exceptions) =====
+      // The game MUST animate to the next question after an answer is chosen. Clicking
+      // during that animation selects the next card blindly → wrong answers. So after
+      // every click we block until the on-screen question has actually changed.
+      if (i < lastTrueFalseAnswers.length - 1) {
+        const w = await waitForTfNextQuestion(lastQinfo);
+        if (w.ok) {
+          lastQinfo = w.info;
+        } else if (w.unreadable) {
+          // Screen unreadable (no counter, no text): fixed human-like wait.
+          // TF transition ≈ 2.8s + card settle + human reading beat — 4.6s..5.5s.
+          await sleep(getRandomHumanDelay(4600, 5500));
+          lastQinfo = await getCurrentTfQuestionInfo();
+        } else {
+          // Readable but never advanced within 12s (timeout). Do NOT click blind —
+          // wait more and re-read; count it so the summary toast can warn.
+          skippedNoAdvance++;
+          console.warn(`[English Master AI] ⚠️ Sau câu ${i + 1}: màn hình chưa chuyển câu — đợi thêm 3s.`);
+          await sleep(3000);
+          lastQinfo = await getCurrentTfQuestionInfo();
+        }
+      }
+    }
+
+    showToast(`🎧 Hoàn thành: đã chọn ${clicked}/${lastTrueFalseAnswers.length} câu${skippedNoAdvance ? ` (⚠️ ${skippedNoAdvance} lần chờ màn hình)` : ""}!`);
+    return clicked > 0;
+  }
+
+  // 6. UNIVERSAL AUTO-FILL & AUTO-SELECT (True/False • MCQ • Fill Inputs)
+  async function triggerUniversalAutoFillOrSelect() {
+    // If Matching Pairs Game
+    if (lastMatchingPairs && lastMatchingPairs.length > 0) {
+      await executeMatchingClicksSequentially();
+      return;
+    }
+
+    // Multi-question True/False listening: click all N answers sequentially
+    if (lastTrueFalseAnswers && lastTrueFalseAnswers.length > 0) {
+      await executeTrueFalseClicksSequentially();
+      return;
+    }
+
+    // Cocos Creator games: click the real node on the canvas via the MAIN-world bridge
+    if (isCocosGame() && lastAnswerParsed) {
+      const clicked = await cocosAutoAnswer(lastAnswerParsed);
+      if (clicked) return;
+    }
+
+    if (!lastAnswerParsed) {
+      showToast("Chưa có đáp án để tự điền.");
+      return;
+    }
+
+    const cleanAns = lastAnswerParsed.trim();
+    const cleanLower = cleanAns.toLowerCase();
+    let actionTaken = false;
+
+    // A. True / False Game (Dọn rác bãi biển)
+    if (cleanLower === "true" || cleanLower === "false" || cleanLower.startsWith("true") || cleanLower.startsWith("false")) {
+      const isTrue = cleanLower.startsWith("true");
+
+      // DOM True/False buttons
+      const trueBtn = document.querySelector('.btn-true, button[title*="True"], [data-value="true"]');
+      const falseBtn = document.querySelector('.btn-false, button[title*="False"], [data-value="false"]');
+      if (isTrue && trueBtn) {
+        trueBtn.click();
+        actionTaken = true;
+      } else if (!isTrue && falseBtn) {
+        falseBtn.click();
+        actionTaken = true;
+      }
+
+      // Canvas Game True/False buttons (Right column on Dọn rác bãi biển)
+      const canvas = findGameCanvas();
+      if (canvas && !actionTaken) {
+        const rect = canvas.getBoundingClientRect();
+        const width = rect.width;
+        const height = rect.height;
+
+        // True button oval center: X = 75.8%, Y = 17.5%
+        // False button oval center: X = 75.2%, Y = 28.9%
+        const targetX = isTrue ? (rect.left + (width * 0.758)) : (rect.left + (width * 0.752));
+        const targetY = isTrue ? (rect.top + (height * 0.175)) : (rect.top + (height * 0.289));
+
+        simulateClick(canvas, targetX, targetY);
+        setTimeout(() => simulateClick(canvas, targetX, targetY), 50);
+
+        actionTaken = true;
+        showToast(`⚡ Đã tự động chọn [${isTrue ? 'True' : 'False'}] trên màn hình!`);
+      }
+
+      if (actionTaken) {
+        showToast(`✅ Đã tự chọn [${isTrue ? 'True' : 'False'}]!`);
+        return;
+      }
+    }
+
+    // B. Multiple Choice Answer (A, B, C, D)
+    const mcqMatch = cleanAns.match(/^([A-D])(?:\.\s*|\s+)?(.*)$/i);
+    if (mcqMatch) {
+      const choiceLetter = mcqMatch[1].toUpperCase();
+      const choiceText = mcqMatch[2] ? mcqMatch[2].trim() : "";
+      const canvas = findGameCanvas();
+
+      actionTaken = clickMultipleChoiceOption(choiceLetter, choiceText, canvas);
+      if (actionTaken) {
+        showToast(`✅ Đã tự chọn đáp án [${choiceLetter}] ${choiceText ? `(${choiceText})` : ''}!`);
+        return;
+      }
+    }
+
+    // C. Fill Text Inputs
+    const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, .input-answer, #txtAnswer'));
+    const visibleInputs = inputs.filter(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).display !== "none";
+    });
+
+    if (visibleInputs.length > 0) {
+      const words = cleanAns.split(/\s+/);
+
+      if (visibleInputs.length === 1) {
+        fillInputElement(visibleInputs[0], cleanAns);
+        actionTaken = true;
+      } else {
+        visibleInputs.forEach((input, i) => {
+          if (words[i]) {
+            fillInputElement(input, words[i]);
+            actionTaken = true;
+          }
+        });
+      }
+
+      if (actionTaken) {
+        showToast(`✍️ Đã điền: "${cleanAns}"!`);
+        visibleInputs[visibleInputs.length - 1].focus();
+        return;
+      }
+    }
+
+    navigator.clipboard.writeText(cleanAns);
+    showToast(`📋 Đã copy đáp án: "${cleanAns}"`);
+  }
+
+  async function triggerHumanizedAutoFillOrSelect(customText = null) {
+    if (lastMatchingPairs && lastMatchingPairs.length > 0) {
+      await executeMatchingClicksSequentially();
+      return;
+    }
+
+    const textToFill = (customText || lastAnswerParsed || "").trim();
+    if (!textToFill) return;
+
+    // Check if True/False or MCQ
+    if (textToFill.toLowerCase().startsWith("true") || textToFill.toLowerCase().startsWith("false") || textToFill.match(/^([A-D])(\.|\s|$)/i)) {
+      triggerUniversalAutoFillOrSelect();
+      return;
+    }
+
+    const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, .input-answer, #txtAnswer'));
+    const visibleInputs = inputs.filter(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).display !== "none";
+    });
+
+    if (visibleInputs.length > 0) {
+      const words = textToFill.split(/\s+/);
+
+      if (visibleInputs.length === 1) {
+        await typeIntoElementHumanLike(visibleInputs[0], textToFill);
+      } else {
+        for (let i = 0; i < visibleInputs.length; i++) {
+          if (words[i]) {
+            await typeIntoElementHumanLike(visibleInputs[i], words[i]);
+            await sleep(getRandomHumanDelay(150, 300));
+          }
+        }
+      }
+      showToast(`✍️ Đã điền: "${textToFill}"!`);
+      return;
+    }
+
+    triggerUniversalAutoFillOrSelect();
+  }
+
+  async function typeIntoElementHumanLike(el, text) {
+    el.focus();
+    el.value = "";
+    for (let i = 0; i < text.length; i++) {
+      el.value += text[i];
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      await sleep(getRandomHumanDelay(45, 110));
+    }
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function fillInputElement(el, text) {
+    el.focus();
+    el.value = text;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function triggerSubmitButton() {
+    const btn = document.querySelector('button#btnAnswer, button.btn-submit, button.btn-answer-submit, #btn_answer, .btn-nopbai, button[class*="submit"]');
+    if (btn) {
+      btn.click();
+      return;
+    }
+    const canvas = findGameCanvas();
+    if (canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const targetX = rect.left + (rect.width * 0.65);
+      const targetY = rect.top + (rect.height * 0.76);
+      simulateClick(canvas, targetX, targetY);
+    }
+  }
+
+  function findGameCanvas() {
+    let canvas = document.querySelector("canvas");
+    if (canvas) return canvas;
+    const iframes = document.querySelectorAll("iframe");
+    for (const iframe of iframes) {
+      try {
+        const c = iframe.contentDocument?.querySelector("canvas");
+        if (c) return c;
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  function renderClickRipple(x, y) {
+    const dot = document.createElement("div");
+    dot.style.cssText = `position: fixed; left: ${x - 14}px; top: ${y - 14}px; width: 28px; height: 28px; border-radius: 50%; background: rgba(239, 68, 68, 0.4); border: 2px solid #ef4444; z-index: 2147483647; pointer-events: none; animation: ioe-ripple 0.5s ease-out forwards;`;
+    document.body.appendChild(dot);
+    setTimeout(() => dot.remove(), 550);
+  }
+
+  function simulateClick(element, clientX, clientY) {
+    if (!element) element = findGameCanvas();
+    if (!element) return;
+
+    renderClickRipple(clientX, clientY);
+
+    const targetEl = document.elementFromPoint(clientX, clientY) || element;
+    const rect = targetEl.getBoundingClientRect ? targetEl.getBoundingClientRect() : element.getBoundingClientRect();
+    const offsetX = clientX - rect.left;
+    const offsetY = clientY - rect.top;
+    const screenX = (window.screenX || 0) + clientX;
+    const screenY = (window.screenY || 0) + clientY;
+
+    const baseEvent = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      detail: 1,
+      screenX: screenX,
+      screenY: screenY,
+      clientX: clientX,
+      clientY: clientY,
+      pageX: clientX + (window.scrollX || 0),
+      pageY: clientY + (window.scrollY || 0),
+      offsetX: offsetX,
+      offsetY: offsetY,
+      x: clientX,
+      y: clientY,
+      layerX: offsetX,
+      layerY: offsetY,
+      button: 0,
+      buttons: 1,
+      which: 1,
+      pointerId: 1,
+      pointerType: "mouse",
+      isPrimary: true
+    };
+
+    // 1. Move to update engine's internal hover/mouse target
+    targetEl.dispatchEvent(new MouseEvent("mousemove", { ...baseEvent, buttons: 0 }));
+    if (window.PointerEvent) {
+      try { targetEl.dispatchEvent(new PointerEvent("pointermove", { ...baseEvent, buttons: 0 })); } catch (e) {}
+    }
+
+    // 2. PointerDown & MouseDown
+    if (window.PointerEvent) {
+      try { targetEl.dispatchEvent(new PointerEvent("pointerdown", baseEvent)); } catch (e) {}
+    }
+    targetEl.dispatchEvent(new MouseEvent("mousedown", baseEvent));
+
+    // 3. PointerUp, MouseUp & Click
+    const upEvent = { ...baseEvent, buttons: 0 };
+    if (window.PointerEvent) {
+      try { targetEl.dispatchEvent(new PointerEvent("pointerup", upEvent)); } catch (e) {}
+    }
+    targetEl.dispatchEvent(new MouseEvent("mouseup", upEvent));
+    targetEl.dispatchEvent(new MouseEvent("click", upEvent));
+
+    // 4. Also dispatch directly on canvas if targetEl was a wrapper/container
+    if (element !== targetEl) {
+      element.dispatchEvent(new MouseEvent("mousemove", { ...baseEvent, buttons: 0 }));
+      element.dispatchEvent(new MouseEvent("mousedown", baseEvent));
+      element.dispatchEvent(new MouseEvent("mouseup", upEvent));
+      element.dispatchEvent(new MouseEvent("click", upEvent));
+    }
+
+    // 5. Direct CreateJS / EaselJS stage hook
+    const win = element.ownerDocument?.defaultView || window;
+    const stage = win.stage || win.exportRoot?.stage || (win.createjs && win.createjs.Stage?._stages?.[0]);
+    if (stage && stage.handleEvent) {
+      try {
+        const scaleX = stage.scaleX || 1;
+        const scaleY = stage.scaleY || 1;
+        const stageX = offsetX / scaleX;
+        const stageY = offsetY / scaleY;
+        stage.mouseX = stageX;
+        stage.mouseY = stageY;
+
+        stage.handleEvent({
+          type: "stagemousedown",
+          stageX: stageX,
+          stageY: stageY,
+          rawX: clientX,
+          rawY: clientY,
+          nativeEvent: baseEvent
+        });
+        stage.handleEvent({
+          type: "stagemouseup",
+          stageX: stageX,
+          stageY: stageY,
+          rawX: clientX,
+          rawY: clientY,
+          nativeEvent: upEvent
+        });
+        stage.handleEvent({
+          type: "click",
+          stageX: stageX,
+          stageY: stageY,
+          rawX: clientX,
+          rawY: clientY,
+          nativeEvent: upEvent
+        });
+      } catch (e) {}
+    }
+  }
+
+  // 6.5 Audio Synchronization Engine
+  async function ensureFreshAudioReady(isAudioGame, timeoutMs = 3000) {
+    if (!isAudioGame) return null;
+    const canvas = findGameCanvas();
+    const startTime = Date.now();
+
+    // If audio is already fresh and ready
+    if (window.__LAST_CAPTURED_IOE_AUDIO__ && window.__LAST_CAPTURED_IOE_AUDIO__.isReady && window.__LAST_CAPTURED_IOE_AUDIO__.base64 && (Date.now() - window.__LAST_CAPTURED_IOE_AUDIO__.timestamp < 15000)) {
+      return window.__LAST_CAPTURED_IOE_AUDIO__;
+    }
+
+    // Trigger Play / Replay button on canvas
+    if (canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const playBtnX = rect.left + (rect.width * 0.165);
+      const playBtnY = rect.top + (rect.height * 0.315);
+      simulateClick(canvas, playBtnX, playBtnY);
+    }
+
+    // Await until audio is intercepted AND converted to Base64
+    while (Date.now() - startTime < timeoutMs) {
+      if (window.__LAST_CAPTURED_IOE_AUDIO__ && window.__LAST_CAPTURED_IOE_AUDIO__.isReady && window.__LAST_CAPTURED_IOE_AUDIO__.base64) {
+        return window.__LAST_CAPTURED_IOE_AUDIO__;
+      }
+      await sleep(100);
+    }
+
+    return window.__LAST_CAPTURED_IOE_AUDIO__ || null;
+  }
+
+  // 6.7 OVERLAY READER - deterministic multi-source extraction into editable box
+  let lastOverlayReadText = "";
+
+  function runOverlayRead(silent = false) {
+    createIOEUI();
+    const readerText = ioeRootEl.querySelector("#ioe-reader-text");
+    const readerStats = ioeRootEl.querySelector("#ioe-reader-stats");
+    if (!readerText) return "";
+
+    let result = { text: "", stats: {} };
+    if (window.__IOE_OVERLAY_READER__) {
+      try { result = window.__IOE_OVERLAY_READER__.readStructured(); } catch (e) { console.warn(e); }
+    }
+
+    lastOverlayReadText = result.text || "";
+
+    if (lastOverlayReadText) {
+      readerText.value = lastOverlayReadText;
+      if (readerStats) {
+        const s = result.stats || {};
+        readerStats.textContent = `${lastOverlayReadText.length} ký tự • ${s.domBlocks || 0} khối DOM${s.hasCanvasText ? " • canvas" : ""}${s.memoryStrings ? " • memory" : ""}`;
+      }
+      if (!silent) showToast(`📖 Đã đọc ${lastOverlayReadText.length} ký tự từ trang.`);
+    } else {
+      if (readerStats) readerStats.textContent = "không đọc được (dán thủ công)";
+      if (!silent) showToast("⚠️ Không đọc được đề từ trang, hãy dán thủ công.");
+    }
+    return lastOverlayReadText;
+  }
+
+  window.runOverlayReadIOE = runOverlayRead;
+
+  // 6.7.1 Build prompt text from the exact IOE game API JSON (Cocos games)
+  function buildGameApiPromptText() {
+    const st = getGameBridgeStateDirect();
+    if (!st || !st.questions || !st.questions.length) return "";
+
+    const lines = [];
+    lines.push("DỮ LIỆU ĐỀ THI ĐỌC TRỰC TIẾP TỪ API GAME IOE (CHÍNH XÁC 100%, KHÔNG CẦN OCR):");
+    lines.push(`Mã đề: ${st.examKey || "?"} | Tổng điểm: ${st.totalPoint || "?"} | Thời gian: ${st.examTime || "?"}s`);
+    if (st.gameDesc) lines.push(`Hướng dẫn game: ${st.gameDesc}`);
+    lines.push("");
+    lines.push(`Tổng số câu: ${st.questions.length}`);
+    lines.push("");
+
+    st.questions.forEach((q) => {
+      const fmt = q.format;
+      let kind = "Khác";
+      if (q.isListening) kind = "NGHE True/False";
+      else if (fmt === 25) kind = "Ghép cặp (Anh-Việt)";
+      else if (q.answers && q.answers.length >= 2) kind = "Trắc nghiệm";
+      else if (q.answers && q.answers.length === 1) kind = "Điền từ/1 đáp án";
+
+      lines.push(`Câu ${q.index} [${kind}] (format=${fmt}, type=${q.type}, điểm=${q.point}):`);
+      if (q.audio) lines.push(`  - File nghe: ${q.audio}`);
+      if (q.prompt) lines.push(`  - Nội dung/Đề: ${q.prompt}`);
+      if (q.answers && q.answers.length) {
+        q.answers.forEach((a, i) => lines.push(`  - Đáp án [${String.fromCharCode(65 + i)}]: ${a}`));
+      }
+      if (q.tans && q.tans.length) lines.push(`  - Đáp án đúng (tans): ${q.tans.join(" | ")}`);
+      lines.push("");
+    });
+
+    if (st.answerPool && st.answerPool.length) {
+      lines.push("KHO ĐÁP ÁN GHÉP CẶP (dùng để ghép với nội dung câu):");
+      st.answerPool.forEach((a, i) => lines.push(`  [${i + 1}] ${a}`));
+      lines.push("");
+    }
+
+    lines.push("YÊU CẦU: Dựa vào dữ liệu trên, hãy đưa ra đáp án đúng cho từng câu theo đúng định dạng tag [ANSWER: ...] / [MATCH_PAIRS: ...]. Với câu NGHE True/False, nghe file audio (đính kèm) và so với câu khẳng định để chọn True/False.");
+    return lines.join("\n");
+  }
+
+  // 6.8 DEEP PASSAGE EXTRACTOR & AUTO-SCROLL CAPTURE ENGINE
+  function extractFullReadingPassage() {
+    let passageParts = [];
+
+    // 0. Prefer deterministic overlay reader if it produced richer text
+    if (window.__IOE_OVERLAY_READER__) {
+      try {
+        const overlayText = window.__IOE_OVERLAY_READER__.readQuestionText();
+        if (overlayText && overlayText.length >= 60) {
+          passageParts.push(overlayText);
+        }
+      } catch (e) {}
+    }
+
+
+    // 1. Check DOM Reading Elements (innerText contains 100% of untruncated story/passage)
+    const domSelectors = [
+      '.reading-content', '.passage', '.reading-text', '.text-reading',
+      '#contentReading', '.exam-reading', '.box-reading', '.scroll-text',
+      '[class*="reading"]', '[class*="passage"]', '[class*="story"]',
+      '#txtQuestion', '.question-title', '.question-content'
+    ];
+
+    const domEls = document.querySelectorAll(domSelectors.join(","));
+    for (const el of domEls) {
+      const txt = (el.innerText || "").trim();
+      if (txt.length >= 60 && !passageParts.includes(txt)) {
+        passageParts.push(txt);
+      }
+    }
+
+    // Check all scrollable DOM elements
+    const allDivs = document.querySelectorAll("div, p, section, article");
+    for (const d of allDivs) {
+      if (d.scrollHeight > d.clientHeight + 40) {
+        const txt = (d.innerText || "").trim();
+        if (txt.length >= 80 && !passageParts.includes(txt)) {
+          passageParts.push(txt);
+        }
+      }
+    }
+
+    // 2. Check CreateJS / EaselJS Stage Tree
+    const canvas = findGameCanvas();
+    if (canvas) {
+      const win = canvas.ownerDocument?.defaultView || window;
+      const stage = win.stage || win.exportRoot?.stage || (win.createjs && win.createjs.Stage?._stages?.[0]);
+      if (stage) {
+        try {
+          const stageTexts = [];
+          function walkStageForText(obj) {
+            if (!obj) return;
+            if (obj.text && typeof obj.text === "string") {
+              const t = obj.text.trim();
+              if (t.length >= 25) stageTexts.push(t);
+            }
+            if (obj.children && Array.isArray(obj.children)) {
+              for (const child of obj.children) walkStageForText(child);
+            }
+          }
+          walkStageForText(stage);
+          if (stageTexts.length > 0) {
+            const joinedStageText = stageTexts.join("\n");
+            if (joinedStageText.length >= 60 && !passageParts.some(p => p.includes(joinedStageText))) {
+              passageParts.push(joinedStageText);
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
+    // 3. Check Global Game Memory
+    const candidateKeys = ["curQuestion", "currentQuestion", "gameData", "testData", "currentQues", "questionData", "examData"];
+    for (const k of candidateKeys) {
+      if (window[k]) {
+        try {
+          const data = window[k];
+          if (typeof data === "object") {
+            const str = JSON.stringify(data);
+            const matches = str.match(/("content"|"reading"|"passage"|"text"|"story")\s*:\s*"([^"]{60,})"/gi);
+            if (matches) {
+              matches.forEach(m => {
+                const clean = m.replace(/^[^:]+:\s*"/, "").replace(/"$/, "").replace(/\\n/g, "\n").replace(/\\"/g, '"');
+                if (clean.length >= 60 && !passageParts.includes(clean)) {
+                  passageParts.push(clean);
+                }
+              });
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
+    return passageParts.join("\n\n---\n\n").trim();
+  }
+
+  // 6.9 SMART AUTO-SCROLL DOUBLE-SHOT SCREENSHOT
+  async function captureSmartScreenshotsWithAutoScroll() {
+    if (ioeRootEl) ioeRootEl.style.opacity = "0";
+    await sleep(70);
+
+    // 1. Capture Top View (Part 1)
+    const topShotResp = await new Promise(resolve => {
+      chrome.runtime.sendMessage({ action: "CAPTURE_TAB_ONLY" }, resolve);
+    });
+    const topShot = topShotResp?.dataUrl || null;
+
+    // 2. Check if there is a scrollable container in DOM or Canvas
+    const scrollableDom = Array.from(document.querySelectorAll("div, section, article, .reading-content, .passage, [class*='scroll']")).find(el => {
+      return el.scrollHeight > el.clientHeight + 40 && el.offsetHeight > 50;
+    });
+
+    const canvas = findGameCanvas();
+    let scrolled = false;
+
+    if (scrollableDom) {
+      scrollableDom.scrollTop = scrollableDom.scrollHeight;
+      scrolled = true;
+    } else if (canvas && !isCocosGame()) {
+      // NOTE: never simulate clicks on a Cocos canvas here — the click lands on a
+      // gameplay node and would pre-select an answer before solving starts.
+      canvas.dispatchEvent(new WheelEvent("wheel", { deltaY: 800, bubbles: true }));
+      scrolled = true;
+    }
+
+    let bottomShot = null;
+    if (scrolled) {
+      // Wait ≥0.5s: Chrome throttles captureVisibleTab to 2 calls/second, so a
+      // second capture fired too soon after the first silently fails.
+      await sleep(600);
+      const bottomShotResp = await new Promise(resolve => {
+        chrome.runtime.sendMessage({ action: "CAPTURE_TAB_ONLY" }, resolve);
+      });
+      bottomShot = bottomShotResp?.dataUrl || null;
+
+      if (scrollableDom) {
+        scrollableDom.scrollTop = 0;
+      }
+    }
+
+    if (ioeRootEl) ioeRootEl.style.opacity = "1";
+
+    if (topShot && bottomShot && topShot !== bottomShot) {
+      console.log("[English Master AI] 📸 Captured 2-Part Multi-Scroll Screenshot (Top + Bottom)!");
+      return [topShot, bottomShot];
+    } else if (topShot) {
+      return [topShot];
+    }
+    return [];
+  }
+
+  // 7. EXECUTE SOLVER
+async function executeScreenAndAudioSolve(customHint = "", callback = null, options = {}) {
+    if (isSolving) return;
+    createIOEUI();
+    panelEl.classList.remove("hidden");
+
+    isSolving = true;
+    lastMatchingPairs = [];
+    lastTrueFalseAnswers = [];
+    const qBox = ioeRootEl.querySelector("#ioe-question-display");
+    const contentBox = ioeRootEl.querySelector("#ioe-panel-content");
+    const hintInput = ioeRootEl.querySelector("#ioe-slot-hint-input");
+    const readerText = ioeRootEl.querySelector("#ioe-reader-text");
+    const useOverride = !!(options && options.textOverride && options.textOverride.trim());
+
+    // Auto-detect game type from URL
+    const isMatchingUrl = window.location.href.includes("ghep-cap") || window.location.href.includes("matching");
+    const isDonRacUrl = window.location.href.includes("don-rac-bai-bien") || window.location.href.includes("don-rac");
+    let detectedSlotInfo = "";
+
+    if (isDonRacUrl && !customHint) {
+      detectedSlotInfo = "Bài thi Nghe True/False (Dọn rác bãi biển)";
+      hintInput.value = detectedSlotInfo;
+    } else if (isMatchingUrl && !customHint) {
+      detectedSlotInfo = "Bài thi Ghép Cặp (12 ô: 3 hàng x 4 cột)";
+      hintInput.value = detectedSlotInfo;
+    } else if (window.__IOE_SLOT_INSPECTOR__ && !customHint) {
+      const analysis = window.__IOE_SLOT_INSPECTOR__.getCompleteSlotAnalysis();
+      if (analysis && analysis.count) {
+        if (analysis.source === "DOM_INPUTS") {
+          detectedSlotInfo = `Đọc từ DOM: ${analysis.count} ô nhập liệu`;
+        } else if (analysis.source === "CANVAS_PIXEL_SCAN") {
+          detectedSlotInfo = `Quét từ Canvas: ${analysis.count} ô gạch dưới`;
+        }
+        hintInput.value = detectedSlotInfo;
+      }
+    }
+
+    const effectiveHint = customHint || detectedSlotInfo;
+
+    // Detect multi-question True/False listening exam via game API (each question has its own audio file)
+    const apiQuestions = getGameQuestions() || [];
+    const isMultiTfExam = apiQuestions.length > 1 && apiQuestions.every(q => q.isListening && q.audio);
+
+    // Ensure audio is captured and Base64 is 100% ready before sending to AI
+    let audioData = null;
+    let multiAudioUrls = null;
+    if (isMultiTfExam) {
+      multiAudioUrls = apiQuestions.map(q => q.audio).filter(Boolean);
+    } else if (isDonRacUrl) {
+      audioData = await ensureFreshAudioReady(true, 3000);
+    }
+
+    qBox.textContent = isAutoRunning ? "🤖 [Tự Làm] Đang phân tích bài thi & đoạn đọc..." : (isMultiTfExam ? `🎧 Đang nghe ${multiAudioUrls.length} câu True/False...` : "📸 Đang chụp bài thi (hỗ trợ cuộn & trích xuất bài đọc)...");
+
+    contentBox.innerHTML = `
+      <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 25px 0;">
+        <div style="width: 32px; height: 32px; border: 3px solid #e2e8f0; border-top-color: #6366f1; border-radius: 50%; animation: spin 0.7s linear infinite; margin-bottom: 12px;"></div>
+        <span style="font-weight: 700; color: #4f46e5; font-size: 14px;">
+          ${isMultiTfExam ? `🎧 Đang nghe & giải ${multiAudioUrls.length} câu True/False...` : (isDonRacUrl ? '🎧 Đang nghe bài đọc & giải True/False...' : (isMatchingUrl ? '🧩 Đang nhận diện & ghép các cặp thẻ...' : 'AI đang phân tích & giải đề thi IOE...'))}
+        </span>
+        <span style="font-size: 11.5px; color: #64748b; margin-top: 6px;">
+          ${effectiveHint ? effectiveHint : 'Tự động nhận diện True/False • Ghép cặp • Trắc nghiệm • Đoạn đọc cuộn • Điền từ'}
+        </span>
+      </div>
+    `;
+
+    // 1. Deep Extract Full Passage Text (100% untruncated by scrollbars)
+    let extractedPassage = "";
+    if (useOverride) {
+      extractedPassage = options.textOverride.trim();
+      if (readerText) readerText.value = extractedPassage;
+      if (ioeRootEl) {
+        const rs = ioeRootEl.querySelector("#ioe-reader-stats");
+        if (rs) rs.textContent = `${extractedPassage.length} ký tự • thủ công`;
+      }
+    } else {
+      // Prefer exact exam JSON captured from the IOE game API (Cocos games)
+      const apiText = buildGameApiPromptText();
+      if (apiText) {
+        extractedPassage = apiText;
+        requestGameBridgeSync();
+        if (readerText) readerText.value = apiText;
+        if (ioeRootEl) {
+          const rs = ioeRootEl.querySelector("#ioe-reader-stats");
+          const qs = getGameQuestions() || [];
+          if (rs) rs.textContent = `${qs.length} câu • 🎮 đọc từ API game (chính xác 100%)`;
+        }
+      } else {
+        extractedPassage = extractFullReadingPassage();
+        if (extractedPassage && readerText && !readerText.value.trim()) readerText.value = extractedPassage;
+        if (extractedPassage && ioeRootEl) {
+          const rs = ioeRootEl.querySelector("#ioe-reader-stats");
+          if (rs) rs.textContent = `${extractedPassage.length} ký tự • tự động`;
+        }
+      }
+    }
+
+    let promptPayloadText = "";
+    if (extractedPassage) {
+      promptPayloadText = `\n\n[ĐỀ BÀI / ĐOẠN VĂN TRÍCH XUẤT TỪ TRANG (ĐÃ ĐẦY ĐỦ, BỎ QUA GIỚI HẠN THANH CUỘN)]:\n${extractedPassage}\n\n`;
+      console.log(`[English Master AI] 📖 Extracted Full Passage (${extractedPassage.length} chars)`);
+    }
+
+    // 2. Multi-Shot Auto-Scroll Screenshot
+    const capturedImages = await captureSmartScreenshotsWithAutoScroll();
+
+    const capturedBase64 = (audioData && audioData.base64) ? audioData.base64 : ((window.__LAST_CAPTURED_IOE_AUDIO__ && window.__LAST_CAPTURED_IOE_AUDIO__.base64) ? window.__LAST_CAPTURED_IOE_AUDIO__.base64 : null);
+    const activeAudioUrl = (audioData && audioData.url) ? audioData.url : (window.__LAST_CAPTURED_IOE_AUDIO__ ? window.__LAST_CAPTURED_IOE_AUDIO__.url : null);
+
+    chrome.runtime.sendMessage({
+      action: "SOLVE_CURRENT_SCREEN",
+      images: capturedImages.length > 0 ? capturedImages : null,
+      text: promptPayloadText,
+      audioUrl: activeAudioUrl,
+      audioBase64: capturedBase64,
+      audioUrls: multiAudioUrls,
+      hint: effectiveHint
+    }, (resp) => {
+      isSolving = false;
+      if (!resp) {
+        contentBox.innerHTML = '<div style="color: red; padding: 10px;">Không thể kết nối đến extension.</div>';
+        if (callback) callback(false, null, false, false, false);
+        return;
+      }
+
+      if (resp.success) {
+        let rawAnswer = resp.data;
+        let isMatching = false;
+        let isTrueFalse = false;
+        let isMcq = false;
+        let isMultiTf = false;
+        let bannerHtml = "";
+
+        // Check for MULTI True/False tag FIRST: [TF_ANSWERS: 1. True, 2. False, ...]
+        const tfTag = rawAnswer.match(/\[TF_ANSWERS:\s*([^\]]+)\]/i);
+        if (tfTag) {
+          isMultiTf = true;
+          const inner = tfTag[1];
+          lastTrueFalseAnswers = [];
+          // Accept both "1. True", "1: True", "1 - True" and bare "True, False, ..." lists
+          let bareListCount = 0;
+          const numbered = inner.match(/(\d+)\s*[.\):-]\s*(true|false)/gi);
+          if (numbered && numbered.length) {
+            for (const tok of numbered) {
+              const m = tok.match(/(\d+)\s*[.\):-]\s*(true|false)/i);
+              const idx = parseInt(m[1]);
+              const val = m[2].toLowerCase() === "true";
+              lastTrueFalseAnswers[idx - 1] = val;
+            }
+          } else {
+            const toks = inner.split(/[,;]+/).map(s => s.trim()).filter(Boolean);
+            bareListCount = toks.length;
+            toks.forEach((t, i) => { lastTrueFalseAnswers[i] = t.toLowerCase().startsWith("t"); });
+          }
+          // Compact sparse array & validate — pad back to the FULL question count
+          // from the game API so a partially-numbered AI answer (e.g. 8 of 10)
+          // still leaves slots for every question. Missing slots default to True
+          // (listening statements are usually correct assertions).
+          const totalQuestions = Math.max(apiQuestions.length, lastTrueFalseAnswers.length, 1);
+          const padded = [];
+          for (let k = 0; k < totalQuestions; k++) {
+            padded.push(typeof lastTrueFalseAnswers[k] === "boolean" ? lastTrueFalseAnswers[k] : true);
+          }
+          lastTrueFalseAnswers = padded;
+
+          rawAnswer = rawAnswer.replace(/\[TF_ANSWERS:\s*[^\]]+\]/i, "").trim();
+          lastAnswerParsed = lastTrueFalseAnswers.map((v, i) => `${i + 1}. ${v ? "True" : "False"}`).join(", ");
+
+          // Count how many slots the AI actually answered (for the note below)
+          const aiAnsweredCount = (numbered && numbered.length) ? numbered.length : bareListCount;
+
+          const tfChips = lastTrueFalseAnswers.map((v, idx) => `
+            <span class="ioe-slot-chip" style="${v ? "background:#dcfce7; border-color:#10b981;" : "background:#fee2e2; border-color:#ef4444;"}">
+              Câu ${idx + 1}: <strong>${v ? "True" : "False"}</strong>
+            </span>
+          `).join("");
+
+          const missingNote = (aiAnsweredCount < lastTrueFalseAnswers.length)
+            ? `<div style="margin-top:6px; font-size:11.5px; color:#b45309; font-weight:600;">⚠️ AI trả lời ${aiAnsweredCount}/${lastTrueFalseAnswers.length} câu — câu thiếu mặc định True (khẳng định nghe thường đúng)</div>`
+            : "";
+
+          bannerHtml = `
+            <div class="ioe-ans-banner">
+              <div class="ioe-ans-label">
+                <span>🎧 KẾT QUẢ TRUE/FALSE (${lastTrueFalseAnswers.length} CÂU)</span>
+              </div>
+              <div class="ioe-slot-chips">${tfChips}</div>
+              ${missingNote}
+            </div>
+          `;
+        } else {
+          // Check for MATCH_PAIRS tag
+          const matchPairTag = rawAnswer.match(/\[MATCH_PAIRS:\s*([^\]]+)\]/i);
+          if (matchPairTag) {
+          isMatching = true;
+          const pairsStr = matchPairTag[1].trim();
+          const pairTokens = pairsStr.split(/[,;\s]+/).filter(Boolean);
+          lastMatchingPairs = pairTokens.map(p => p.split("-")).filter(p => p.length === 2);
+          lastAnswerParsed = pairsStr;
+
+          rawAnswer = rawAnswer.replace(/\[MATCH_PAIRS:\s*[^\]]+\]/i, "").trim();
+
+          const pairChips = lastMatchingPairs.map((p, idx) => `
+            <span class="ioe-slot-chip" onclick="clickMatchingPairDirectly(${p[0]}, ${p[1]})" title="Click để tự bấm cặp này">
+              Cặp ${idx+1}: <strong>Ô ${p[0]} ↔ Ô ${p[1]}</strong>
+            </span>
+          `).join("");
+
+          bannerHtml = `
+            <div class="ioe-ans-banner">
+              <div class="ioe-ans-label">
+                <span>🧩 KẾT QUẢ GHÉP CẶP (${lastMatchingPairs.length} CẶP)</span>
+                <span>(Click ô để tự bấm)</span>
+              </div>
+              <div class="ioe-slot-chips">${pairChips}</div>
+            </div>
+          `;
+        } else {
+          // Normal ANSWER tag
+          const match = rawAnswer.match(/\[ANSWER:\s*([^\]]+)\]/i);
+          if (match) {
+            lastAnswerParsed = match[1].trim();
+            rawAnswer = rawAnswer.replace(/\[ANSWER:\s*[^\]]+\]/i, "").trim();
+          } else {
+            lastAnswerParsed = "";
+          }
+
+          if (lastAnswerParsed.toLowerCase() === "true" || lastAnswerParsed.toLowerCase() === "false") {
+            isTrueFalse = true;
+          }
+
+          const mcqCheck = lastAnswerParsed.match(/^([A-D])(?:\.\s*|\s+)?(.*)$/i);
+          if (mcqCheck) {
+            isMcq = true;
+          }
+
+          let slotChipsHtml = "";
+          if (isMcq) {
+            const optLetter = mcqCheck[1].toUpperCase();
+            const optText = mcqCheck[2] ? mcqCheck[2].trim() : "";
+            slotChipsHtml = `
+              <div class="ioe-slot-chips">
+                <span class="ioe-slot-chip" style="background: #4f46e5; color: #ffffff; border-color: #4338ca; cursor: pointer;" onclick="triggerUniversalAutoFillOrSelect()" title="Click để tự động chọn đáp án này">
+                  🎯 Tự chọn đáp án: <strong>[${optLetter}]</strong> ${optText ? `(${escapeHtml(optText)})` : ''}
+                </span>
+              </div>
+            `;
+          } else if (!isTrueFalse && lastAnswerParsed && lastAnswerParsed.includes(" ")) {
+            const words = lastAnswerParsed.split(/\s+/);
+            const chips = words.map((w, idx) => `
+              <span class="ioe-slot-chip" onclick="navigator.clipboard.writeText('${w}'); alert('Đã copy ô ${idx+1}: ${w}')">
+                Ô ${idx+1}: <strong>${escapeHtml(w)}</strong> (${w.length} ký tự)
+              </span>
+            `).join("");
+            slotChipsHtml = `<div class="ioe-slot-chips">${chips}</div>`;
+          }
+
+          if (lastAnswerParsed) {
+            bannerHtml = `
+              <div class="ioe-ans-banner">
+                <div class="ioe-ans-label">
+                  <span>✨ ${isMcq ? 'ĐÁP ÁN TRẮC NGHIỆM' : (isTrueFalse ? 'KẾT QUẢ TRUE / FALSE' : 'ĐÁP ÁN CHÍNH XÁC')}</span>
+                </div>
+                <div class="ioe-ans-value">${escapeHtml(lastAnswerParsed)}</div>
+                ${slotChipsHtml}
+              </div>
+            `;
+          }
+        }
+        }
+
+        qBox.textContent = isMultiTf ? `🎧 Đã giải xong ${lastTrueFalseAnswers.length} câu True/False — đang tự click...` : (isTrueFalse ? `🎧 Đáp án: ${lastAnswerParsed}` : (isMatching ? "🧩 Đã nhận diện & ghép xong các cặp thẻ!" : (isMcq ? `🎯 Đáp án trắc nghiệm: ${lastAnswerParsed}` : "✅ Đã giải xong câu hỏi!")));
+
+        const parsedHtml = (window.marked && window.marked.parse) ? window.marked.parse(rawAnswer) : rawAnswer;
+
+        contentBox.innerHTML = `
+          ${bannerHtml}
+          <div class="ioe-md-content">
+            ${parsedHtml}
+          </div>
+        `;
+
+        if (lastAnswerParsed) {
+          navigator.clipboard.writeText(lastAnswerParsed);
+        }
+
+        if (callback) callback(true, lastAnswerParsed, resp.hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf);
+      } else {
+        contentBox.innerHTML = `
+          <div style="color: #b91c1c; background: #fef2f2; padding: 12px; border-radius: 8px; line-height: 1.5;">
+            <strong>⚠️ Lỗi:</strong> ${escapeHtml(resp.error)}
+          </div>
+        `;
+        if (callback) callback(false, null, false, false, false, false);
+      }
+    });
+  }
+
+  window.clickMatchingPairDirectly = function (cellA, cellB) {
+    clickMatchingCell(cellA);
+    setTimeout(() => clickMatchingCell(cellB), 350);
+    showToast(`🧩 Đã bấm cặp: Ô ${cellA} ↔ Ô ${cellB}!`);
+  };
+
+  function showToast(msg) {
+    const toast = document.createElement("div");
+    toast.style.cssText = "position: fixed; bottom: 24px; right: 24px; background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 8px; z-index: 2147483647; font-size: 13.5px; font-weight: 600; box-shadow: 0 6px 16px rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.15); pointer-events: none; animation: ioe-fade-down 0.2s;";
+    toast.textContent = msg;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 2600);
+  }
+
+  function escapeHtml(text) {
+    if (!text) return "";
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  // Keyboard Shortcuts
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "F2" || (e.ctrlKey && e.code === "Space")) {
+      e.preventDefault();
+      if (window.__IOE_SOLVE_AND_AUTOCLICK__) window.__IOE_SOLVE_AND_AUTOCLICK__("");
+      else executeScreenAndAudioSolve();
+    }
+    if (e.key === "F4") {
+      e.preventDefault();
+      toggleAutoPilot();
+    }
+    if (e.key === "Escape" && isAutoRunning) {
+      stopAutoPilot();
+    }
+  });
+
+  function initIOE() {
+    createIOEUI();
+    setTimeout(createIOEUI, 500);
+    setTimeout(createIOEUI, 1500);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initIOE);
+  } else {
+    initIOE();
+  }
+
+})();
+
