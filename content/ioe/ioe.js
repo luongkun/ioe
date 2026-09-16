@@ -1,5 +1,5 @@
 /**
- * English Master AI - Dedicated IOE Universal Game Solver v2.13.0
+ * English Master AI - Dedicated IOE Universal Game Solver v2.13.1
  * Supports: True/False Listening (Dọn rác bãi biển), Matching Pairs (Ghép Cặp 12 ô), MCQ (Tái tạo san hô, Fansipan, Leo núi), Long Reading Passage Auto-Scroll & Extraction
  */
 
@@ -7,7 +7,7 @@
   if (window.__IOE_MASTER_LOADED__) return;
   window.__IOE_MASTER_LOADED__ = true;
 
-  console.log("%c[English Master AI v2.13.0] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
+  console.log("%c[English Master AI v2.13.1] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
 
   // 1. Super Unblocker
   function superUnblockAll() {
@@ -331,12 +331,15 @@
       else unknownIdx.push(i);
     });
 
+    // BUG#17: nhớ lại lỗi thật của AI để cuối cùng hiển thị đúng nguyên nhân
+    let aiError = null;
     if (unknownIdx.length) {
       const cachedCount = qs.length - unknownIdx.length;
       showToast(`🎧 Bài nghe điền từ: AI đang nghe ${unknownIdx.length}/${qs.length} câu${cachedCount ? ` (đã nhớ ${cachedCount} câu gặp trước đó)` : ""}...`);
       const promptText = buildFillWordPrompt(qs, unknownIdx, st);
       const audioUrls = unknownIdx.map(i => qs[i].audio).filter(Boolean);
       const resp = await askAiForGame(promptText, { audioUrls, examKind: "fillword" });
+      aiError = (resp && !resp.success) ? resp.error : null;
       const tag = (resp && resp.success) ? String(resp.data || "").match(/\[FILL_WORDS:\s*([^\]]+)\]/i) : null;
       if (tag) {
         const items = parseTagItems(tag[1]);
@@ -347,7 +350,7 @@
             saveQCacheEntry(qCacheKeyFor(qs[qi], pool), answers[qi]);
           }
         });
-      } else {
+      } else if (!aiError) {
         showToast("⚠️ AI không trả được danh sách từ — hãy bấm lại Tự Làm.");
       }
     } else {
@@ -369,6 +372,14 @@
     });
 
     renderFillWordsResult(qs, answers);
+
+    // BUG#17: sau AI + rescue kho từ mà KHÔNG có từ nào → báo lỗi thật thay vì
+    // vẽ bảng "1.? 2.? 3.?" rồi lặng lẽ không làm gì
+    if (!answers.filter(Boolean).length) {
+      renderAiFailurePanel(aiError || "AI không trả được danh sách từ sau khi đã thử kho từ gợi ý.", `nghe điền từ ${qs.length} câu`);
+      showToast("❌ Không giải được — xem hướng dẫn trong panel");
+      return false;
+    }
 
     // GÕ NGUYÊN TỪ TRƯỚC (v2.13.0 — fixed regression v2.12.1): phần lớn game
     // (mock + nhiều game thật) nhận NGUYÊN TỪ vào EditBox. Riêng game hiện sẵn
@@ -445,17 +456,32 @@
     if (unknownIdx.length) {
       showToast(`🎯 Trắc nghiệm ${qs.length} câu: AI đang giải ${unknownIdx.length} câu còn lại...`);
       const resp = await askAiForGame(buildMcqMultiPrompt(qs, unknownIdx, st), { examKind: "mcq_multi" });
-      const tag = (resp && resp.success) ? String(resp.data || "").match(/\[MCQ_ANSWERS:\s*([^\]]+)\]/i) : null;
-      if (tag) {
-        const items = parseTagItems(tag[1]);
-        unknownIdx.forEach((qi, k) => {
-          const v = items[k] != null ? String(items[k]).trim().toUpperCase() : "";
-          const m = v.match(/^([A-D])/);
-          if (m) {
-            picks[qi] = m[1];
-            saveQCacheEntry(qCacheKeyFor(qs[qi], pool), m[1]);
-          }
-        });
+      // BUG#17: AI fail → KHÔNG render bảng "?" — báo lỗi thật trong panel, thoát sớm
+      if (!resp || !resp.success) {
+        const known = picks.filter(Boolean).length;
+        if (!known) {
+          renderAiFailurePanel(resp && resp.error, `trắc nghiệm ${qs.length} câu`);
+          showToast("❌ Không giải được — xem hướng dẫn trong panel");
+          return false;
+        }
+        showToast(`⚠️ AI lỗi nhưng còn ${known} câu trong cache — làm tiếp phần đã biết`);
+      } else {
+        const tag = String(resp.data || "").match(/\[MCQ_ANSWERS:\s*([^\]]+)\]/i);
+        if (tag) {
+          const items = parseTagItems(tag[1]);
+          unknownIdx.forEach((qi, k) => {
+            const v = items[k] != null ? String(items[k]).trim().toUpperCase() : "";
+            const m = v.match(/^([A-D])/);
+            if (m) {
+              picks[qi] = m[1];
+              saveQCacheEntry(qCacheKeyFor(qs[qi], pool), m[1]);
+            }
+          });
+        } else if (!picks.filter(Boolean).length) {
+          // AI trả lời nhưng không đúng định dạng — cũng là fail, không vẽ bảng "?"
+          renderAiFailurePanel("AI trả lời không đúng định dạng [MCQ_ANSWERS: 1. B, 2. A, ...] — bấm Tự Làm để thử lại.", `trắc nghiệm ${qs.length} câu`);
+          return false;
+        }
       }
     } else {
       showToast(`⚡ Đã nhớ sẵn đáp án cả ${qs.length} câu trắc nghiệm — làm ngay!`);
@@ -651,6 +677,33 @@
       </div>`;
   }
 
+  // BUG#17: khi AI fail (chưa nhập key / key sai / mạng...) — hiển thị LỖI THẬT
+  // trong panel kèm hướng dẫn khắc phục, thay vì render bảng "1.? 2.? 3.?"
+  // (bản cũ: solveAndClickMcqMulti vẫn vẽ 10 chip "?" đỏ như thể đã có kết quả,
+  // user không biết nguyên nhân là gì — chỉ thấy "nó không giải được").
+  function renderAiFailurePanel(errorMsg, kindLabel) {
+    const qBox = ioeRootEl?.querySelector("#ioe-question-display");
+    const contentBox = ioeRootEl?.querySelector("#ioe-panel-content");
+    if (qBox) qBox.textContent = "❌ Không giải được" + (kindLabel ? " — " + kindLabel : "");
+    if (!contentBox) return;
+    const raw = String(errorMsg || "AI không phản hồi.");
+    const isKeyErr = /api[\s_-]?key/i.test(raw) || /chưa có gemini/i.test(raw);
+    contentBox.innerHTML = `
+      <div style="color:#b91c1c;background:#fef2f2;padding:14px;border-radius:10px;line-height:1.65;font-size:13px;border:1px solid #fecaca;">
+        <strong>⚠️ Không giải được${kindLabel ? " (" + escapeHtml(kindLabel) + ")" : ""}.</strong><br>
+        <span style="color:#7f1d1d;">${escapeHtml(raw)}</span>
+        ${isKeyErr ? `
+          <hr style="border:none;border-top:1px solid #fecaca;margin:10px 0;">
+          <strong>Cách khắc phục (2 phút):</strong>
+          <ol style="margin:6px 0 0 18px;padding:0;">
+            <li>Bấm biểu tượng <strong>English Master AI</strong> trên thanh công cụ Chrome.</li>
+            <li>Tab <strong>Cài đặt API Key</strong> → dán Gemini API Key (bắt đầu bằng <code>AIza...</code>).</li>
+            <li>Chưa có key? Lấy <strong>MIỄN PHÍ</strong> tại <strong>aistudio.google.com/app/apikey</strong> (đăng nhập Google → Create API key).</li>
+            <li>Bấm <strong>Lưu</strong> → <strong>Kiểm tra kết nối</strong> → thấy "thành công" rồi quay lại đây bấm <strong>Tự Làm</strong>.</li>
+          </ol>` : ""}
+      </div>`;
+  }
+
   function renderMcqMultiResult(qs, picks) {
     const qBox = ioeRootEl?.querySelector("#ioe-question-display");
     const contentBox = ioeRootEl?.querySelector("#ioe-panel-content");
@@ -811,7 +864,7 @@
     ioeRootEl.innerHTML = `
       <div class="ioe-control-pill" id="ioe-pill-toggle">
         <div class="ioe-badge-icon">IOE</div>
-        <span class="ioe-pill-title">English Master v2.13.0</span>
+        <span class="ioe-pill-title">English Master v2.13.1</span>
         <span id="ioe-audio-detected-badge" class="ioe-audio-pill hidden" title="Phát hiện bài thi nghe">🎧 Audio</span>
         <span id="ioe-game-api-badge" class="ioe-api-pill hidden" title="Đã đọc đề trực tiếp từ API game">🎮 API</span>
         <div class="ioe-pill-btn-group">

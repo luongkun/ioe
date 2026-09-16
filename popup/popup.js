@@ -2,8 +2,11 @@
  * English Master AI - Popup Logic
  */
 
-const DEFAULT_KEY = "YOUR_API_KEY_HERE"; // TODO: replace with real key
-const DEFAULT_MODEL = "gemini-3.7-flash";
+// BUG#16: bỏ placeholder "YOUR_API_KEY_HERE" — bản cũ prefill nó vào ô nhập,
+// lưu vào storage khi user bấm Lưu mà chưa nhập, và badge dài >10 ký tự nên
+// hiện "AI Sẵn sàng" dù KHÔNG có key thật → user tưởng đã cấu hình xong.
+const DEFAULT_KEY = "";
+const DEFAULT_MODEL = "gemini-2.5-flash"; // BUG#16c: "gemini-3.7-flash" không tồn tại trên Generative Language API
 
 document.addEventListener("DOMContentLoaded", async () => {
   // Elements
@@ -61,20 +64,32 @@ document.addEventListener("DOMContentLoaded", async () => {
       autoShowToolbar: true
     });
 
-    apiKeyInput.value = config.geminiApiKey || DEFAULT_KEY;
+    const savedKey = normalizeKey(config.geminiApiKey);
+    // KHÔNG prefill placeholder vào ô nhập — để trống, placeholder HTML hướng dẫn
+    apiKeyInput.value = savedKey;
     modelSelect.value = config.model || DEFAULT_MODEL;
     autoToolbarToggle.checked = config.autoShowToolbar !== false;
 
-    updateStatusBadge(config.geminiApiKey || DEFAULT_KEY);
+    updateStatusBadge(savedKey);
+  }
+
+  // Coi placeholder của bản cũ ("YOUR_API_KEY_HERE") như CHƯA CÓ key
+  function normalizeKey(k) {
+    const s = String(k || "").trim();
+    return /^your[_-]?api[_-]?key/i.test(s) ? "" : s;
   }
 
   function updateStatusBadge(key) {
-    if (key && key.trim().length > 10) {
+    const k = normalizeKey(key);
+    if (k && k.trim().length > 10 && /^AIza[\w-]{20,}$/.test(k.trim())) {
       statusBadge.className = "status-indicator ready";
       statusText.textContent = "AI Sẵn sàng (Đã kích hoạt)";
+    } else if (k && k.trim().length > 10) {
+      statusBadge.className = "status-indicator missing";
+      statusText.textContent = "Key đã lưu nhưng định dạng lạ (key Gemini bắt đầu bằng AIza) — bấm Kiểm tra kết nối";
     } else {
       statusBadge.className = "status-indicator missing";
-      statusText.textContent = "Chưa có API Key";
+      statusText.textContent = "Chưa có API Key — dán key vào bên dưới rồi bấm Lưu";
     }
   }
 
@@ -92,7 +107,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   saveKeyBtn.addEventListener("click", async () => {
-    const key = apiKeyInput.value.trim();
+    const key = normalizeKey(apiKeyInput.value.trim());
     const model = modelSelect.value;
     const autoToolbar = autoToolbarToggle.checked;
 
@@ -103,7 +118,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
 
     updateStatusBadge(key);
-    showTestMsg("Đã lưu cài đặt thành công!", "success");
+    if (!key) {
+      showTestMsg("Đã lưu nhưng CHƯA có API Key — AI sẽ không giải được. Lấy key miễn phí tại aistudio.google.com/app/apikey, dán vào rồi bấm Lưu & Kiểm tra.", "error");
+    } else {
+      showTestMsg("Đã lưu cài đặt thành công! Khuyên dùng: bấm 'Kiểm tra kết nối' để chắc chắn key hoạt động.", "success");
+    }
   });
 
   modelSelect.addEventListener("change", async () => {
@@ -115,10 +134,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   testKeyBtn.addEventListener("click", () => {
-    const key = apiKeyInput.value.trim();
+    const key = normalizeKey(apiKeyInput.value.trim());
     const model = modelSelect.value;
     if (!key) {
-      showTestMsg("Vui lòng nhập API Key trước khi kiểm tra.", "error");
+      showTestMsg("Vui lòng nhập API Key trước khi kiểm tra (lấy miễn phí tại aistudio.google.com/app/apikey).", "error");
       return;
     }
 

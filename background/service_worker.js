@@ -1,10 +1,13 @@
 /**
- * English Master AI - Background Service Worker v2.11.0
+ * English Master AI - Background Service Worker v2.13.1
  * Universal Game Type Classifier: True/False Listening • Matching Pairs • MCQ • Fill Blanks
  */
 
 const DEFAULT_CONFIG = {
-  geminiApiKey: "YOUR_API_KEY_HERE",
+  // BUG#16: KHÔNG ship placeholder "YOUR_API_KEY_HERE" — chuỗi không rỗng nên
+  // vượt qua check rỗng, được gửi thẳng lên Google → 400 "API key not valid".
+  // Default rỗng → check ở callGeminiWithFallback bắn hướng dẫn nhập key ngay.
+  geminiApiKey: "",
   model: "gemini-2.5-flash",
   autoShowToolbar: true,
   targetLanguage: "vi"
@@ -193,11 +196,14 @@ async function callSingleModel(modelName, apiKey, promptText, imageBase64 = null
 
 async function callGeminiWithFallback(text, taskType, customApiKey, customModel, imageBase64 = null, audioObj = null, customHint = "", audioList = null, examKind = null) {
   const config = await chrome.storage.local.get(DEFAULT_CONFIG);
-  const apiKey = customApiKey || config.geminiApiKey || DEFAULT_CONFIG.geminiApiKey;
+  let apiKey = customApiKey || config.geminiApiKey || DEFAULT_CONFIG.geminiApiKey;
+  apiKey = String(apiKey || "").trim();
   const primaryModel = customModel || config.model || DEFAULT_CONFIG.model;
 
-  if (!apiKey || !apiKey.trim()) {
-    throw new Error("Chưa cấu hình Gemini API Key. Hãy mở popup extension để nhập API Key miễn phí từ Google AI Studio.");
+  // BUG#16: key rỗng hoặc placeholder ("YOUR_API_KEY_HERE" từ bản cũ) → hướng dẫn
+  // nhập key NGAY, không gửi request nào lên Google cả.
+  if (!apiKey || /^your[_-]?api[_-]?key/i.test(apiKey)) {
+    throw new Error("Chưa có Gemini API Key. Bấm biểu tượng extension English Master AI → tab 'Cài đặt API Key' → dán API Key (lấy MIỄN PHÍ tại aistudio.google.com/app/apikey) → bấm Lưu & Kiểm tra.");
   }
 
   const systemPrompt = PROMPTS[taskType] || PROMPTS.ioe_auto;
@@ -268,8 +274,18 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
     } catch (err) {
       console.warn(`[English Master AI] Model ${model} failed (${err.message}). Trying fallback...`);
       lastError = err;
-      if (err.status === 400 && err.message.includes("API_KEY_INVALID")) {
-        throw new Error("API Key không hợp lệ. Vui lòng kiểm tra lại trong Popup Extension.");
+      // BUG#16: Google từ chối key (400/401/403 "API key not valid..." / "API_KEY_INVALID")
+      // → DỪNG NGAY chuỗi fallback: cùng 1 key, 7 model cũng fail y hệt (mất 10-20s
+      // vô ích) và lỗi bị gán nhãn sai thành "model quá tải". Bản cũ chỉ khớp chuỗi
+      // "API_KEY_INVALID" mà thông điệp thật của Google là "API key not valid.
+      // Please pass a valid API key." → không bao giờ khớp.
+      const emsg = String(err && err.message || "");
+      if ((err.status === 400 || err.status === 401 || err.status === 403) &&
+          (/api[\s_-]?key/i.test(emsg) || /API_KEY_INVALID/i.test(emsg))) {
+        throw new Error("API Key KHÔNG HỢP LỆ (Google từ chối: " + emsg + "). Mở popup extension → tab 'Cài đặt API Key' → kiểm tra key. Lấy key miễn phí tại aistudio.google.com/app/apikey rồi bấm 'Lưu & Kiểm tra'.");
+      }
+      if (err.status === 403 && /has not been used|is disabled|Generative Language/i.test(emsg)) {
+        throw new Error("API Key hợp lệ nhưng chưa bật 'Generative Language API' trong Google Cloud project. Mở console.cloud.google.com → APIs & Services → Library → tìm 'Generative Language API' → Enable.");
       }
       // Rate-limit (429) or server-side (5xx) errors are usually transient — pause
       // briefly so the next fallback model isn't hit instantly while the quota is
@@ -280,7 +296,12 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
     }
   }
 
-  throw new Error(`Tất cả các model AI đang quá tải: ${lastError?.message || "Vui lòng thử lại sau giây lát."}`);
+  // BUG#16: thông điệp cuối trung thực theo loại lỗi thật — chỉ 429 mới là "quá tải"
+  const lastMsg = String(lastError?.message || "Vui lòng thử lại sau giây lát.");
+  if (lastError && lastError.status === 429) {
+    throw new Error("Hết quota / quá tải toàn bộ " + modelQueue.length + " model AI (429). Chờ 1-2 phút rồi bấm giải lại. Chi tiết: " + lastMsg);
+  }
+  throw new Error(`Không gọi được AI (đã thử ${modelQueue.length} model): ${lastMsg}`);
 }
 
 // Chrome throttles captureVisibleTab to 2 calls/second. The auto-scroll solver
