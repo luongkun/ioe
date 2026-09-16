@@ -1,5 +1,5 @@
 /**
- * English Master AI - Background Service Worker v2.13.1
+ * English Master AI - Background Service Worker v2.13.2
  * Universal Game Type Classifier: True/False Listening • Matching Pairs • MCQ • Fill Blanks
  */
 
@@ -8,20 +8,30 @@ const DEFAULT_CONFIG = {
   // vượt qua check rỗng, được gửi thẳng lên Google → 400 "API key not valid".
   // Default rỗng → check ở callGeminiWithFallback bắn hướng dẫn nhập key ngay.
   geminiApiKey: "",
-  model: "gemini-2.5-flash",
+  // BUG#18: "gemini-2.5-flash" đã bị Google khai tử (404 "no longer available
+  // to new users") → mọi request fail ngay cả key hợp lệ. Chuỗi model mới được
+  // xác minh trực tiếp trên Generative Language API (16/09/2026):
+  //   SỐNG: gemini-3.6-flash (mặc định — Google recommend, ổn định nhất),
+  //         gemini-3.7-flash (mới nhất, thỉnh thoảng 503 high-demand),
+  //         gemini-3.5-flash, gemini-flash-latest, gemini-flash-lite-latest
+  //   CHẾT: gemini-2.5-flash, gemini-2.0-flash, gemini-2.5-flash-lite,
+  //         gemini-2.5-pro, gemini-3-pro-preview
+  model: "gemini-3.6-flash",
   autoShowToolbar: true,
   targetLanguage: "vi"
 };
 
 // Real, publicly available Gemini model IDs (aliases first — they track the
 // current generation without breaking when versions rotate).
+// BUG#18: toàn bộ chuỗi 2.x đã bị retire — thay bằng chuỗi 3.x đã verify.
+// Thứ tự: 3.6 ổn định nhất lên đầu; 3.7 & flash-latest hay dính 503 high-demand
+// nhưng vẫn là dự phòng tốt (fallback chỉ mất ~1s mỗi lần chuyển).
 const FALLBACK_MODELS = [
+  "gemini-3.6-flash",
+  "gemini-3.7-flash",
   "gemini-flash-latest",
-  "gemini-2.5-flash",
-  "gemini-2.0-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-2.5-pro",
-  "gemini-pro-latest"
+  "gemini-flash-lite-latest",
+  "gemini-3.5-flash"
 ];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -167,14 +177,27 @@ async function callSingleModel(modelName, apiKey, promptText, imageBase64 = null
     generationConfig: {
       temperature: 0.1,
       topP: 0.95,
-      maxOutputTokens: 2048
+      // BUG#18d: model 3.x mặc định "thinking" tiêu tốn budget output — 2048
+      // có thể bị thinking ăn hết → text rỗng. Nâng 8192 cho đề dài/ảnh lớn.
+      maxOutputTokens: 8192
     }
   };
 
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    // BUG#20: fetch KHÔNG timeout — mạng chậm/proxy treo làm panel đứng vĩnh viễn
+    // (user thấy "đang giải..." mãi không xong). 60s đủ cho đề dài + ảnh + audio;
+    // hết giờ → throw → chuỗi fallback chuyển model kế tiếp (kết nối mới).
+    signal: AbortSignal.timeout(60000)
+  }).catch((e) => {
+    if (e && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      const err = new Error("Hết giờ 60s chờ Gemini phản hồi (mạng chậm hoặc kết nối bị treo).");
+      err.status = 0;
+      throw err;
+    }
+    throw e;
   });
 
   const resJson = await response.json().catch(() => ({}));
@@ -280,9 +303,25 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
       // "API_KEY_INVALID" mà thông điệp thật của Google là "API key not valid.
       // Please pass a valid API key." → không bao giờ khớp.
       const emsg = String(err && err.message || "");
+      // BUG#16: Google từ chối key (400/401/403 "API key not valid..." / "API_KEY_INVALID")
+      // → DỪNG NGAY chuỗi fallback: cùng 1 key, mọi model cũng fail y hệt (mất 10-20s
+      // vô ích) và lỗi bị gán nhãn sai thành "model quá tải". Bản cũ chỉ khớp chuỗi
+      // "API_KEY_INVALID" mà thông điệp thật của Google là "API key not valid.
+      // Please pass a valid API key." → không bao giờ khớp.
       if ((err.status === 400 || err.status === 401 || err.status === 403) &&
           (/api[\s_-]?key/i.test(emsg) || /API_KEY_INVALID/i.test(emsg))) {
         throw new Error("API Key KHÔNG HỢP LỆ (Google từ chối: " + emsg + "). Mở popup extension → tab 'Cài đặt API Key' → kiểm tra key. Lấy key miễn phí tại aistudio.google.com/app/apikey rồi bấm 'Lưu & Kiểm tra'.");
+      }
+      // BUG#18b: geo-block — Google chặn API theo vùng IP (400 FAILED_PRECONDITION
+      // "User location is not supported for the API use"). Cùng 1 IP nên mọi model
+      // đều fail y hệt → dừng chuỗi ngay, không thử 6 model vô ích.
+      if (err.status === 400 && /location is not supported|unsupported location|user location/i.test(emsg)) {
+        throw new Error("Google đang chặn khu vực mạng/IP của bạn (không hỗ trợ Gemini API tại vùng đó — ví dụ Hong Kong/Trung Quốc). Hãy đổi mạng (VPN qua Mỹ/Nhật/Singapore) rồi thử lại. Key của bạn vẫn HỢP LỆ. Chi tiết Google: " + emsg);
+      }
+      // BUG#18c: model bị khai tử (404 "no longer available to new users" /
+      // "not found for API version") — không phải lỗi key, chỉ cần model kế tiếp.
+      if (err.status === 404 && /no longer available|not found for API version/i.test(emsg)) {
+        console.warn(`[English Master AI] Model ${model} đã bị Google retire — chuyển model kế tiếp.`);
       }
       if (err.status === 403 && /has not been used|is disabled|Generative Language/i.test(emsg)) {
         throw new Error("API Key hợp lệ nhưng chưa bật 'Generative Language API' trong Google Cloud project. Mở console.cloud.google.com → APIs & Services → Library → tìm 'Generative Language API' → Enable.");

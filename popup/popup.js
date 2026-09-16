@@ -6,7 +6,8 @@
 // lưu vào storage khi user bấm Lưu mà chưa nhập, và badge dài >10 ký tự nên
 // hiện "AI Sẵn sàng" dù KHÔNG có key thật → user tưởng đã cấu hình xong.
 const DEFAULT_KEY = "";
-const DEFAULT_MODEL = "gemini-2.5-flash"; // BUG#16c: "gemini-3.7-flash" không tồn tại trên Generative Language API
+// BUG#18: gemini-2.5-flash đã bị Google retire → mặc định model mới nhất đã verify
+const DEFAULT_MODEL = "gemini-3.6-flash";
 
 document.addEventListener("DOMContentLoaded", async () => {
   // Elements
@@ -81,12 +82,17 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function updateStatusBadge(key) {
     const k = normalizeKey(key);
-    if (k && k.trim().length > 10 && /^AIza[\w-]{20,}$/.test(k.trim())) {
+    // BUG#19: Google phát hành key định dạng MỚI "AQ.xxxx..." (48+ ký tự sau dấu
+    // chấm) song song với dạng cũ "AIza...". Regex cũ /^AIza[\w-]{20,}$/ từ chối
+    // key mới hợp lệ → badge hiện "định dạng lạ" khiến user tưởng key hỏng.
+    const isOldFormat = /^AIza[\w-]{20,}$/.test(k.trim());
+    const isNewFormat = /^AQ\.[\w-]{20,}$/.test(k.trim());
+    if (k && k.trim().length > 10 && (isOldFormat || isNewFormat)) {
       statusBadge.className = "status-indicator ready";
       statusText.textContent = "AI Sẵn sàng (Đã kích hoạt)";
     } else if (k && k.trim().length > 10) {
       statusBadge.className = "status-indicator missing";
-      statusText.textContent = "Key đã lưu nhưng định dạng lạ (key Gemini bắt đầu bằng AIza) — bấm Kiểm tra kết nối";
+      statusText.textContent = "Key đã lưu nhưng định dạng lạ (key Gemini bắt đầu bằng AIza... hoặc AQ....) — bấm Kiểm tra kết nối";
     } else {
       statusBadge.className = "status-indicator missing";
       statusText.textContent = "Chưa có API Key — dán key vào bên dưới rồi bấm Lưu";
