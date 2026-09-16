@@ -1,5 +1,5 @@
 /**
- * English Master AI - Dedicated IOE Universal Game Solver v2.11.0
+ * English Master AI - Dedicated IOE Universal Game Solver v2.12.1
  * Supports: True/False Listening (Dọn rác bãi biển), Matching Pairs (Ghép Cặp 12 ô), MCQ (Tái tạo san hô, Fansipan, Leo núi), Long Reading Passage Auto-Scroll & Extraction
  */
 
@@ -7,7 +7,7 @@
   if (window.__IOE_MASTER_LOADED__) return;
   window.__IOE_MASTER_LOADED__ = true;
 
-  console.log("%c[English Master AI v2.11.0] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
+  console.log("%c[English Master AI v2.12.1] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
 
   // 1. Super Unblocker
   function superUnblockAll() {
@@ -358,11 +358,24 @@
 
     renderFillWordsResult(qs, answers);
 
+    // Chỉ gõ PHẦN BỊ CHE của từ (live-caught trên ioe.vn): EditBox của game chỉ
+    // nhận đúng maskStars ký tự — prefix (vd "ca" trong "ca****") đã hiển thị sẵn
+    // trong câu. Gõ nguyên từ "calmly" vào ô 4 ký bị từ chối với popup
+    // "Vui lòng nhập đủ số ký tự" và cả bài kẹt tại câu đó.
+    function typedPortion(word, q) {
+      const pref = String((q && q.maskPrefix) || "").toLowerCase();
+      const w = String(word || "");
+      if (pref && w.toLowerCase().startsWith(pref) && w.length > pref.length) return w.slice(pref.length);
+      return w;
+    }
+
     const total = qs.length;
     const typed = await runPerQuestionActions(total, async (i) => {
       const word = answers[i];
       if (!word) return false;
-      const typeResp = await ioeBridgeRequest("TYPE_EDITBOX", { text: word, index: 0 }, 8000);
+      const q = qs[i] || {};
+      let typedWord = typedPortion(word, q);
+      const typeResp = await ioeBridgeRequest("TYPE_EDITBOX", { text: typedWord, index: 0 }, 8000);
       const typedOk = !!(typeResp && typeResp.payload && typeResp.payload.ok);
       if (!typedOk) {
         // Game dùng chip từ bấm được thay cho EditBox → bấm chip
@@ -370,8 +383,28 @@
         if (!(clickResp && clickResp.payload && clickResp.payload.ok)) return false;
       }
       await sleep(getRandomHumanDelay(600, 1100));
-      await ioeBridgeRequest("CONFIRM_ANSWER", {}, 8000);
-      showToast(`✍️ Câu ${i + 1}/${total}: ${word}`);
+      let confirmResp = await ioeBridgeRequest("CONFIRM_ANSWER", {}, 8000);
+      // Retry ONCE khi validation chặn: gõ lại (controller-last write) + confirm.
+      if (confirmResp && confirmResp.payload && confirmResp.payload.reason === "validation_popup") {
+        console.warn("[English Master AI] Confirm bị chặn (" + (confirmResp.payload.popup || "validate") + ") — gõ lại câu " + (i + 1));
+        await sleep(500);
+        await ioeBridgeRequest("TYPE_EDITBOX", { text: typedWord, index: 0 }, 8000);
+        await sleep(getRandomHumanDelay(500, 900));
+        confirmResp = await ioeBridgeRequest("CONFIRM_ANSWER", {}, 8000);
+      }
+      // CỨU VÒNG: nếu vẫn bị chặn (AI trả từ sai độ dài / game kẹt), gõ từ trung
+      // tính đủ đúng số ký tự mask để submit (mất điểm câu này) —quan trọng hơn
+      // là game NEXT câu, vòng thi vẫn hoàn thành và finishGame được gọi.
+      if (confirmResp && confirmResp.payload && confirmResp.payload.reason === "validation_popup") {
+        const fillLen = Math.max(1, q.maskStars || typedWord.length || 4);
+        const rescue = "abcdefghij".slice(0, Math.min(fillLen, 10));
+        console.warn("[English Master AI] Câu " + (i + 1) + " kẹt validation — gõ từ cứu vòng '" + rescue + "' để next câu");
+        await sleep(400);
+        await ioeBridgeRequest("TYPE_EDITBOX", { text: rescue, index: 0 }, 8000);
+        await sleep(getRandomHumanDelay(500, 900));
+        confirmResp = await ioeBridgeRequest("CONFIRM_ANSWER", {}, 8000);
+      }
+      showToast(`✍️ Câu ${i + 1}/${total}: ${word}${confirmResp && confirmResp.payload && confirmResp.payload.reason === "validation_popup" ? " (chưa nộp được)" : ""}`);
       return true;
     }, "✍️ Điền từ xong");
 
@@ -616,7 +649,7 @@
     ioeRootEl.innerHTML = `
       <div class="ioe-control-pill" id="ioe-pill-toggle">
         <div class="ioe-badge-icon">IOE</div>
-        <span class="ioe-pill-title">English Master v2.11.0</span>
+        <span class="ioe-pill-title">English Master v2.12.1</span>
         <span id="ioe-audio-detected-badge" class="ioe-audio-pill hidden" title="Phát hiện bài thi nghe">🎧 Audio</span>
         <span id="ioe-game-api-badge" class="ioe-api-pill hidden" title="Đã đọc đề trực tiếp từ API game">🎮 API</span>
         <div class="ioe-pill-btn-group">

@@ -618,19 +618,20 @@
     const word = String(text || "").trim();
     let typedViaDom = 0;
     let viaController = false;
+    let ctrl = null;
+    try { ctrl = findQuestionController(); } catch (e) {}
 
-    // --- 0. THE REAL PATH: drive the game's own controller (live-validated:
-    //     this is the only route that updates inputTxt → validation → submit;
-    //     direct eb.string assignment renders nothing and the game rejects it
-    //     with "Vui lòng nhập đủ số ký tự"). ---
+    // --- 0. Render the word in the game's own EditBox (dienDoanVan path). ---
+    //     NOTE: ctrl.onEditTextChange(word) is NOT called here — it must run
+    //     LAST (see step 3) or later sync events overwrite inputTxt with a
+    //     truncated value (live-caused: "forests" → "for" via hook logging).
     try {
-      const ctrl = findQuestionController();
-      if (ctrl) {
-        ctrl.onEditTextChange(word);          // inputTxt = word
-        try { if (ctrl.dienDoanVan && ctrl.dienDoanVan.getFirstEditBox) { const fe = ctrl.dienDoanVan.getFirstEditBox(); if (fe) fe.string = word; } } catch (e) {}
-        viaController = true;
+      if (ctrl && ctrl.dienDoanVan && ctrl.dienDoanVan.getFirstEditBox) {
+        const fe = ctrl.dienDoanVan.getFirstEditBox();
+        if (fe) fe.string = word;
       }
     } catch (e) {}
+    if (ctrl) viaController = true;
 
     // --- 1. ALSO click the EditBox like a user + type into the engine's DOM
     //     input (keeps engine-side state consistent on OTHER Cocos games where
@@ -673,7 +674,20 @@
       return { ok: false, reason: e.message, boxes: boxes.length };
     }
     syncCocosDomInputs(word);
-    return { ok: true, boxes: boxes.length, typed: word, typedViaDom, viaController, dismissed };
+
+    // --- 3. CONTROLLER LAST (the authoritative write): every earlier engine
+    //     event can leave inputTxt truncated (hook-verified live: a trailing
+    //     input event from syncCocosDomInputs emitted "for" and clobbered
+    //     "forests"). The game validates & submits from ctrl.inputTxt, so the
+    //     controller call MUST be the final write. ---
+    let inputTxtFinal = null;
+    try {
+      if (ctrl) {
+        ctrl.onEditTextChange(word);
+        inputTxtFinal = String(ctrl.inputTxt == null ? "" : ctrl.inputTxt);
+      }
+    } catch (e) {}
+    return { ok: true, boxes: boxes.length, typed: word, typedViaDom, viaController, inputTxt: inputTxtFinal, dismissed };
   }
 
   // Click the game's ANSWER / confirm button ("Click ANSWER or use ENTER key")
@@ -690,7 +704,15 @@
       const ctrl = findQuestionController();
       if (ctrl && findEditBoxes().length) {
         ctrl.onKeyEnterPress();
-        return { ok: true, via: "controller.onKeyEnterPress" };
+        // Post-check: if the validation failed the game shows a "Vui lòng nhập
+        // đủ số ký tự" popup SYNCHRONOUSLY — report it instead of fake success
+        // (live-caused: ok:true while 0 AnswerCheck calls, root cause of the
+        // "type but never submit" failure mode).
+        const popupText = readActivePopupText();
+        if (popupText && /nh\u1eadp \u0111\u1ee7|s\u1ed1 k\xfd t\u1ef1/i.test(popupText)) {
+          return { ok: false, reason: "validation_popup", popup: popupText, via: "controller.onKeyEnterPress", inputTxt: String(ctrl.inputTxt == null ? "" : ctrl.inputTxt) };
+        }
+        return { ok: true, via: "controller.onKeyEnterPress", inputTxt: String(ctrl.inputTxt == null ? "" : ctrl.inputTxt) };
       }
     } catch (e) {}
     // 1. Well-known button node names
@@ -722,6 +744,29 @@
       } catch (e) {}
     }
     return { ok: false, reason: "no_confirm_target" };
+  }
+
+  // Text of the currently-open system popup (or null) — used by confirmAnswer
+  // to detect the synchronous "Vui lòng nhập đủ số ký tự" validation popup.
+  function readActivePopupText() {
+    try {
+      const cc = getCC();
+      if (!cc) return null;
+      const nodes = allNodes().filter(n => n && n.activeInHierarchy !== false);
+      const popupNode = nodes.find(n => /^popup/i.test(n.name || ""));
+      if (!popupNode) return null;
+      const texts = [];
+      for (const n of nodes) {
+        let p = n.parent, under = false, guard = 0;
+        while (p && guard < 25) { if (p === popupNode) { under = true; break; } p = p.parent; guard++; }
+        if (!under) continue;
+        try {
+          const l = cc.Label && n.getComponent && n.getComponent(cc.Label);
+          if (l && l.string) texts.push(String(l.string));
+        } catch (e) {}
+      }
+      return texts.join(" ").trim() || null;
+    } catch (e) { return null; }
   }
 
   // Dismiss late-appearing system dialogs (e.g. the Windows-10 upgrade notice).
