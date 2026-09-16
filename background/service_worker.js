@@ -226,6 +226,14 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
     fullPrompt += "\n\n[CHÚ Ý: BÀI TRẮC NGHIỆM NHIỀU CÂU. Hãy giải TỪNG câu trong đề và trả về dòng đầu tiên theo định dạng [MCQ_ANSWERS: 1. B, 2. A, ...] với ĐỦ mọi câu!]";
   }
 
+  // Dạng mới Vòng 6 (16/09/2026): biến đổi câu gõ từ + điền từ đoạn văn
+  if (examKind === "transform") {
+    fullPrompt += "\n\n[CHÚ Ý: BÀI BIẾN ĐỔI CÂU (sentence transformation). Với MỖI câu, điền các từ còn thiếu vào ô trống [B1], [B2]... của câu thứ hai để nghĩa bằng câu thứ nhất, DÙNG ĐÚNG từ trong kho từ cho trước (mỗi từ đúng 1 lần, có thể có từ gây nhiễu). Trả về dòng đầu tiên theo định dạng [TRANSFORM_WORDS: 1. must | be | careful, 2. to | going, ...] — số thứ tự câu, các từ của câu đó phân cách bằng dấu | !]";
+  }
+  if (examKind === "cloze") {
+    fullPrompt += "\n\n[CHÚ Ý: BÀI ĐIỀN TỪ VÀO ĐOẠN VĂN. Điền MỖI từ trong kho từ vào đúng một ô trống (1)____, (2)____... của đoạn văn sao cho đúng ngữ pháp và nghĩa. Trả về dòng đầu tiên theo định dạng [CLOZE_WORDS: 1. every, 2. called, ...] — đúng thứ tự ô trống!]";
+  }
+
   if (text) {
     fullPrompt += "\n\n--- ĐỀ BÀI CẦN GIẢI ---\n" + text;
   } else {

@@ -211,6 +211,17 @@
   function nodeWorld(node) {
     const cc = getCC();
     if (!node) return { x: 0, y: 0 };
+    // Cocos 3.x: getWorldPosition là API chuẩn. PHẢI thử TRƯỚC vì
+    // convertToWorldSpaceAR (API 2.x) không tồn tại trên Node 3.x và
+    // parent-sum cho toạ độ SAI khi parent có scale/anchor (live-caught:
+    // nút OK của thanh-pho-xanh lệch 130px → click trượt hoàn toàn).
+    try {
+      if (typeof node.getWorldPosition === "function") {
+        const wp = node.getWorldPosition();
+        if (wp && typeof wp.x === "number" && (wp.x !== 0 || wp.y !== 0)) return { x: wp.x, y: wp.y };
+      }
+    } catch (e) {}
+    // Cocos 2.x: convertToWorldSpaceAR
     try {
       if (node.convertToWorldSpaceAR && cc && cc.v2) {
         const v = node.convertToWorldSpaceAR(cc.v2(0, 0));
@@ -223,6 +234,24 @@
       x += p.x || 0; y += p.y || 0; p = p.parent; guard++;
     }
     return { x, y };
+  }
+
+  // Click bằng TouchEvent (một số game Cocos 2.x — vd hanh-tinh-tim —
+  // CHỈ xử lý touch, mouse event bị bỏ qua hoàn toàn; live-caught 16/09/2026).
+  function fireTouch(el, type, x, y) {
+    try {
+      const opts = {
+        bubbles: true, cancelable: true, composed: true, view: window,
+        clientX: x, clientY: y, screenX: (window.screenX || 0) + x, screenY: (window.screenY || 0) + y
+      };
+      const t = new Touch({ identifier: 1, target: el, clientX: x, clientY: y, radiusX: 2, radiusY: 2, rotationAngle: 0, force: 1 });
+      el.dispatchEvent(new TouchEvent(type, Object.assign(opts, {
+        touches: type === "touchend" ? [] : [t],
+        targetTouches: type === "touchend" ? [] : [t],
+        changedTouches: [t]
+      })));
+      return true;
+    } catch (e) { return false; }
   }
 
   function getCanvas() {
@@ -261,6 +290,10 @@
     const cv = getCanvas();
     if (!cv) return false;
     try {
+      // Touch trước (game Cocos 2.x chỉ nghe touch), mouse sau (game 3.x nghe cả hai;
+      // fire kép không hại vì engine tự khử trùng theo pointerId/type).
+      fireTouch(cv, "touchstart", x, y);
+      fireTouch(cv, "touchend", x, y);
       fireMouse(cv, "mousemove", x, y);
       fireMouse(cv, "mousedown", x, y);
       fireMouse(cv, "mouseup", x, y);
@@ -395,23 +428,46 @@
     let closed = 0, started = 0;
     // 1. Close intro/warning popups — the real games show a system-requirements
     //    dialog whose button is named btnOK (plus btn_close variants).
-    const closedNames = ["btn_close", "btnClose", "btnOK", "ok_btn", "btn_ok", "btnOkay"];
+    //    btn_dongy / btn_OK: biến thể mới gặp ở thanh-pho-xanh & cuon-giay-bi-an
+    //    (16/09/2026) — nút "đồng ý/OK" không có cc.Button component nên phải
+    //    click bằng toạ độ (clickNode) thay vì chỉ emit("click").
+    const closedNames = ["btn_close", "btnClose", "btnOK", "ok_btn", "btn_ok", "btnOkay", "btn_dongy", "btn_OK"];
     for (const nm of closedNames) {
-      const n = findNodeByName(nm);
-      if (n) { try { n.emit("click"); closed++; } catch (e) {} }
+      let n = null;
+      try { n = findNodeByName(nm); } catch (e) {}
+      if (n) {
+        try { n.emit("click"); closed++; } catch (e) {}
+        // emit không đủ cho nút không có Button component → click toạ độ DOM
+        await sleep(250);
+        try { clickNode(n); closed++; } catch (e) {}
+      }
     }
-    // Also close any active button whose label is exactly "OK"
-    const okLabel = findNodeByText("ok", { contains: false });
-    if (okLabel && isButton(okLabel)) { try { okLabel.emit("click"); closed++; } catch (e) {} }
+    // Also close any active button whose label is exactly "OK" / "Đồng ý" / "START"
+    for (const lbl of ["ok", "đồng ý", "start"]) {
+      const okLabel = findNodeByText(lbl, { contains: false });
+      if (okLabel) { try { clickNode(okLabel); closed++; } catch (e) {} }
+    }
     // Give the scene a beat to settle after closing the popup BEFORE pressing
     // start — pressing both in the same tick loses the start press (the scene
     // is still switching) and the round dies instantly with "Total Time 00:00".
-    await sleep(700);
-    // 2. Start the game — ONLY the real start button (emit only).
+    await sleep(900);
+    // 2. Start the game — click toạ độ + emit (một số game cần touch thật).
     //    NEVER touch GAME_PLAY / play / start: those are full-screen containers whose
     //    center overlaps an answer card → would select an option before solving!
-    const n = findNodeByName("start_btn");
-    if (n) { try { n.emit("click"); started++; } catch (e) {} }
+    let n = null;
+    try { n = findNodeByName("start_btn"); } catch (e) {}
+    if (n) {
+      try { n.emit("click"); started++; } catch (e) {}
+      await sleep(250);
+      try { clickNode(n); started++; } catch (e) {}
+    }
+    // 2b. Một số game (thanh-pho-xanh) TÁI DÙNG node btn_dongy làm nút START —
+    //     nếu vẫn chưa start và btn_dongy đang active, click nó lần nữa.
+    if (started === 0) {
+      let d = null;
+      try { d = findNodeByName("btn_dongy"); } catch (e) {}
+      if (d) { try { clickNode(d); started++; } catch (e) {} }
+    }
     // 3. The Windows-10 upgrade notice pops up a beat AFTER the start press —
     //    dismiss it right away or it swallows the first question's inputs.
     await sleep(1500);
@@ -880,6 +936,183 @@
     window.postMessage({ __ioeBridge: true, type: type, payload: payload, reqId: reqId }, window.location.origin);
   }
 
+  // ================== NEW GAME TYPES (live-verified 16/09/2026) ==================
+
+  // Tìm mọi EditBox đang active, sắp xếp theo vị trí trên màn hình (trên→xuống, trái→phải)
+  function orderedEditBoxes() {
+    const cc = getCC();
+    const out = [];
+    if (!cc || !cc.director || !cc.director.getScene) return out;
+    (function walk(n) {
+      if (!n) return;
+      let active = true;
+      try { active = n.activeInHierarchy !== false; } catch (e) {}
+      if (!active) return;
+      try {
+        const eb = n.getComponent(cc.EditBox);
+        if (eb) out.push({ n, eb });
+      } catch (e) {}
+      (n.children || []).forEach(walk);
+    })(cc.director.getScene());
+    return out.map(b => {
+      const w = nodeWorld(b.n);
+      return { node: b.n, eb: b.eb, world: w, string: b.eb.string, maxLength: b.eb.maxLength };
+    }).sort((a, b) => (b.world.y - a.world.y) || (a.world.x - b.world.x));
+  }
+
+  // Đọc màn hình game tổng quát — phục vụ 3 dạng mới:
+  //  * transform typing (hanh-tinh-tim): câu 1 + skeleton câu 2 + EditBox masks
+  //  * MCQ khung_tracnghiem (thanh-pho-xanh): options từ node khung_tracnghiem*
+  //  * cloze chip (cuon-giay-bi-an): word bank từ controller _lstAnswers
+  function readGameScreen() {
+    const cc = getCC();
+    const out = { qNumber: null, first: null, skeleton: null, editboxes: [], khungOptions: [], wordBank: null, answerBtn: null, clozeBlanks: 0 };
+    if (!cc || !cc.director || !cc.director.getScene) return out;
+    const nodes = [];
+    (function walk(n, d) {
+      if (!n || d > 90) return;
+      nodes.push(n);
+      (n.children || []).forEach(c => walk(c, d + 1));
+    })(cc.director.getScene(), 0);
+    // RICHTEXT_CHILD theo vị trí
+    const rts = [];
+    for (const n of nodes) {
+      let active = true;
+      try { active = n.activeInHierarchy !== false; } catch (e) {}
+      if (!active) continue;
+      try {
+        const l = n.getComponent(cc.Label);
+        if (l && l.string) {
+          const t = String(l.string).trim();
+          if (n.name === "number_lbl" && /^\d+$/.test(t)) out.qNumber = parseInt(t, 10);
+          if (n.name === "RICHTEXT_CHILD" && t) rts.push({ t, w: nodeWorld(n) });
+        }
+      } catch (e) {}
+      if (n.name === "btnA" || n.name === "submit") {
+        try { out.answerBtn = nodeWorld(n); } catch (e) {}
+      }
+    }
+    // EditBox ordered
+    out.editboxes = orderedEditBoxes().map((b, i) => ({ i, maxLength: b.maxLength, string: b.string, world: b.world }));
+    // chia câu 1 / câu 2 theo gap lớn nhất giữa các dòng
+    if (rts.length) {
+      rts.sort((a, b) => (b.w.y - a.w.y) || (a.w.x - b.w.x));
+      let splitIdx = 0, maxGap = 0;
+      for (let i = 1; i < rts.length; i++) {
+        const gap = rts[i - 1].w.y - rts[i].w.y;
+        if (gap > maxGap) { maxGap = gap; splitIdx = i; }
+      }
+      if (maxGap > 100 && out.editboxes.length) {
+        out.first = rts.slice(0, splitIdx).map(r => r.t).join(" ");
+        const segs = rts.slice(splitIdx).map(r => ({ type: "text", t: r.t, w: r.w }));
+        out.editboxes.forEach(eb => segs.push({ type: "blank", i: eb.i, w: eb.world }));
+        segs.sort((a, b) => (b.w.y - a.w.y) || (a.w.x - b.w.x));
+        out.skeleton = segs.map(s => (s.type === "text" ? s.t : "[B" + (s.i + 1) + "]")).join(" ");
+      } else {
+        out.first = rts.map(r => r.t).join(" ");
+      }
+    }
+    // khung_tracnghiem options (thanh-pho-xanh: khung_tracnghiem, -001, -002, -003)
+    for (const n of nodes) {
+      if (!/^khung_tracnghiem(-\d+)?$/.test(n.name || "")) continue;
+      let active = true;
+      try { active = n.activeInHierarchy !== false; } catch (e) {}
+      if (!active) continue;
+      let marker = null;
+      const words = [];
+      (function collect(x) {
+        if (!x) return;
+        try {
+          const l = x.getComponent(cc.Label);
+          if (l && l.string) {
+            const t = String(l.string).trim();
+            if (/^[A-D]\.$/.test(t)) marker = t[0];
+            else if (t && t !== ".") words.push(t);
+          }
+        } catch (e) {}
+        (x.children || []).forEach(collect);
+      })(n);
+      if (words.length || marker) out.khungOptions.push({ marker, text: words.join(" "), world: nodeWorld(n) });
+    }
+    out.khungOptions.sort((a, b) => (a.marker || "Z").localeCompare(b.marker || "Z"));
+    // cloze controller (cuon-giay-bi-an): component có _curentSelectIndex
+    out.cloze = findClozeController();
+    if (out.cloze) {
+      out.wordBank = out.cloze._lstAnswers || null;
+      out.clozeBlanks = (out.cloze._lstSelect || []).length;
+      delete out.cloze; // không serialise component
+    }
+    return out;
+  }
+
+  // Tìm controller của game cloze (cuon-giay-bi-an): component có thuộc tính _curentSelectIndex
+  function findClozeController() {
+    const cc = getCC();
+    if (!cc || !cc.director || !cc.director.getScene) return null;
+    let ctrl = null;
+    (function walk(n) {
+      if (!n || ctrl) return;
+      try {
+        for (const c of n.getComponents(cc.Component)) {
+          if (c && Object.prototype.hasOwnProperty.call(c, "_curentSelectIndex")) { ctrl = c; break; }
+        }
+      } catch (e) {}
+      if (!ctrl) (n.children || []).forEach(walk);
+    })(cc.director.getScene());
+    return ctrl;
+  }
+
+  // Set nhiều EditBox cùng lúc (mảng text theo thứ tự position) — dạng transform typing
+  function fillEditBoxes(texts) {
+    const boxes = orderedEditBoxes();
+    const results = [];
+    for (let i = 0; i < boxes.length; i++) {
+      const text = (texts || [])[i];
+      if (text == null) break;
+      try {
+        boxes[i].eb.string = String(text);
+        try { boxes[i].eb.node.emit("editing-did-ended"); } catch (e) {}
+        results.push(String(boxes[i].eb.string));
+      } catch (e) { results.push(null); }
+    }
+    return results;
+  }
+
+  // Nộp bài cloze trực tiếp qua controller (bypass UI click từng chip —
+  // hit-test của chip không nhận mouse synthetic; live-caught 16/09/2026)
+  function submitCloze(wordsPerBlank) {
+    const ctrl = findClozeController();
+    if (!ctrl) return { ok: false, reason: "no cloze controller" };
+    try {
+      const n = (ctrl._lstSelect || []).length;
+      const chipWords = ctrl._lstAnswers || [];
+      ctrl._lstSelect = (wordsPerBlank || []).slice(0, n).map((w, i) => {
+        const idx = chipWords.indexOf(w);
+        return { index: idx >= 0 ? idx : i, contents: w };
+      });
+      while (ctrl._lstSelect.length < n) ctrl._lstSelect.push(null);
+      try { ctrl._updateQuestionContainer && ctrl._updateQuestionContainer(); } catch (e) {}
+      const selected = ctrl._isSelectedAll;
+      if (!selected) return { ok: false, reason: "not all filled", select: ctrl._lstSelect };
+      ctrl.onSubmitGame();
+      return { ok: true, submitted: true, select: ctrl._lstSelect.map(s => s && s.contents) };
+    } catch (e) {
+      return { ok: false, reason: e.message };
+    }
+  }
+
+  // Click nút ANSWER/submit của màn chơi (btnA — hanh-tinh-tim; submit — cuon-giay)
+  function clickAnswerButton() {
+    const cc = getCC();
+    if (!cc || !cc.director || !cc.director.getScene) return { ok: false };
+    for (const nm of ["btnA", "submit", "btn_answer"]) {
+      let n = null;
+      try { n = findNodeByName(nm); } catch (e) {}
+      if (n) { try { clickNode(n); return { ok: true, name: nm }; } catch (e) {} }
+    }
+    return { ok: false };
+  }
+
   window.addEventListener("message", async (ev) => {
     if (ev.source && ev.source !== window) return;
     const d = ev.data;
@@ -937,6 +1170,18 @@
             } : { found: false });
           })();
           break;
+        case "READ_GAME_SCREEN":
+          reply(reqId, "GAME_SCREEN", readGameScreen());
+          break;
+        case "FILL_EDITBOXES":
+          reply(reqId, "FILL_EDITBOXES_OK", fillEditBoxes((d.data || {}).texts));
+          break;
+        case "SUBMIT_CLOZE":
+          reply(reqId, "SUBMIT_CLOZE_OK", submitCloze((d.data || {}).words));
+          break;
+        case "CLICK_ANSWER_BTN":
+          reply(reqId, "CLICK_ANSWER_BTN_OK", clickAnswerButton());
+          break;
         default:
           break;
       }
@@ -956,7 +1201,11 @@
     typeIntoEditBox: typeIntoEditBox,
     confirmAnswer: confirmAnswer,
     dismissSystemPopups: dismissSystemPopups,
-    findQuestionController: findQuestionController
+    findQuestionController: findQuestionController,
+    readGameScreen: readGameScreen,
+    fillEditBoxes: fillEditBoxes,
+    submitCloze: submitCloze,
+    clickAnswerButton: clickAnswerButton
   };
 
   // Announce readiness so the isolated script can request a re-sync if needed.

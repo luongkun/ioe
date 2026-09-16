@@ -1,5 +1,5 @@
 /**
- * English Master AI - Dedicated IOE Universal Game Solver v2.12.1
+ * English Master AI - Dedicated IOE Universal Game Solver v2.13.0
  * Supports: True/False Listening (Dọn rác bãi biển), Matching Pairs (Ghép Cặp 12 ô), MCQ (Tái tạo san hô, Fansipan, Leo núi), Long Reading Passage Auto-Scroll & Extraction
  */
 
@@ -7,7 +7,7 @@
   if (window.__IOE_MASTER_LOADED__) return;
   window.__IOE_MASTER_LOADED__ = true;
 
-  console.log("%c[English Master AI v2.12.1] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
+  console.log("%c[English Master AI v2.13.0] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
 
   // 1. Super Unblocker
   function superUnblockAll() {
@@ -134,6 +134,18 @@
     const withTans = qs.filter(q => q.tans && q.tans.length);
     const withOptions = qs.filter(q => q.answers && q.answers.length >= 2);
     const textPairs = deriveMatchPairsFromGameApi();
+
+    // ===== 2 dạng mới gặp ở Vòng 6 (live 16/09/2026) =====
+    // * transform_typing (hanh-tinh-tim): format 19 + type 3 — biến đổi câu
+    //   "It is important that..." → gõ "must be careful" vào EditBox. API trả
+    //   sẵn word-bank (bị xáo trộn) trong answers, cần AI đặt theo ngữ pháp.
+    const allF19T3 = qs.every(q => q.format === 19 && q.type === 3);
+    if (allF19T3 && withOptions.length === qs.length) return "transform_typing";
+    // * cloze_chip (cuon-giay-bi-an): 1 câu duy nhất, prompt là word-bank phân
+    //   cách bằng "|" ("every|all|by|called|took|scored") — điền từ vào đoạn văn
+    //   bằng cách chọn chip; nộp qua controller (submitCloze).
+    const pipeBank = qs.length === 1 && /^\s*\w+(\|\w+)+\s*$/.test(String(qs[0].prompt || ""));
+    if (pipeBank) return "cloze_chip";
 
     // Thứ tự quan trọng: lựa chọn (options) / đáp án sẵn (tans) được xét TRƯỚC
     // mask — đề trắc nghiệm có stem "______" không bị nhận nhầm thành điền từ.
@@ -358,10 +370,11 @@
 
     renderFillWordsResult(qs, answers);
 
-    // Chỉ gõ PHẦN BỊ CHE của từ (live-caught trên ioe.vn): EditBox của game chỉ
-    // nhận đúng maskStars ký tự — prefix (vd "ca" trong "ca****") đã hiển thị sẵn
-    // trong câu. Gõ nguyên từ "calmly" vào ô 4 ký bị từ chối với popup
-    // "Vui lòng nhập đủ số ký tự" và cả bài kẹt tại câu đó.
+    // GÕ NGUYÊN TỪ TRƯỚC (v2.13.0 — fixed regression v2.12.1): phần lớn game
+    // (mock + nhiều game thật) nhận NGUYÊN TỪ vào EditBox. Riêng game hiện sẵn
+    // prefix trong câu (tai-tao-san-ho "ca****") chỉ nhận PHẦN BỊ CHE — gõ nguyên
+    // từ bị popup validation "Vui lòng nhập đủ số ký tự" chặn → khi đó mới gõ
+    // lại phần ẩn (giữ live-fix v2.12.1 cho game đó).
     function typedPortion(word, q) {
       const pref = String((q && q.maskPrefix) || "").toLowerCase();
       const w = String(word || "");
@@ -374,7 +387,7 @@
       const word = answers[i];
       if (!word) return false;
       const q = qs[i] || {};
-      let typedWord = typedPortion(word, q);
+      let typedWord = String(word);
       const typeResp = await ioeBridgeRequest("TYPE_EDITBOX", { text: typedWord, index: 0 }, 8000);
       const typedOk = !!(typeResp && typeResp.payload && typeResp.payload.ok);
       if (!typedOk) {
@@ -384,9 +397,11 @@
       }
       await sleep(getRandomHumanDelay(600, 1100));
       let confirmResp = await ioeBridgeRequest("CONFIRM_ANSWER", {}, 8000);
-      // Retry ONCE khi validation chặn: gõ lại (controller-last write) + confirm.
+      // Game chỉ nhận PHẦN BỊ CHE (prefix hiển thị sẵn): gõ nguyên từ bị chặn →
+      // gõ lại đúng maskStars ký tự phần ẩn (live-verified tai-tao-san-ho).
       if (confirmResp && confirmResp.payload && confirmResp.payload.reason === "validation_popup") {
-        console.warn("[English Master AI] Confirm bị chặn (" + (confirmResp.payload.popup || "validate") + ") — gõ lại câu " + (i + 1));
+        typedWord = typedPortion(word, q);
+        console.warn("[English Master AI] Confirm chặn nguyên từ (" + (confirmResp.payload.popup || "validate") + ") — gõ phần ẩn '" + typedWord + "' câu " + (i + 1));
         await sleep(500);
         await ioeBridgeRequest("TYPE_EDITBOX", { text: typedWord, index: 0 }, 8000);
         await sleep(getRandomHumanDelay(500, 900));
@@ -458,7 +473,10 @@
       let resp = null;
       if (optText) resp = await ioeBridgeRequest("CLICK_TEXT", { text: optText, contains: true }, 8000);
       if (!resp || !resp.payload || !resp.payload.ok) {
-        for (const nm of ["btn" + letter, "btn_" + letter.toLowerCase(), "ans" + letter, "choice" + letter]) {
+        for (const nm of ["btn" + letter, "btn_" + letter.toLowerCase(), "ans" + letter, "choice" + letter,
+          // thanh-pho-xanh (Vòng 6): options là node khung_tracnghiem* — A→(không
+          // hậu tố), B→-001, C→-002, D→-003 (live-verified thứ tự này)
+          "khung_tracnghiem" + (li === 0 ? "" : "-" + String(li).padStart(3, "0"))]) {
           resp = await ioeBridgeRequest("CLICK_NAME", { name: nm }, 8000);
           if (resp && resp.payload && resp.payload.ok) break;
         }
@@ -471,6 +489,148 @@
     }, "🎯 Trắc nghiệm xong");
 
     return done > 0;
+  }
+
+  // =============== TRANSFORM TYPING SOLVER (hanh-tinh-tim, Vòng 6 — 16/09/2026) ===============
+  // "It is important that city planners are careful..." → gõ "must | be | careful"
+  // vào các EditBox của câu thứ 2. Điểm sống còn: IOE XÁO LẠI đề giữa các lần làm
+  // (câu khác nhau mỗi lần mở) nên KHÔNG thể map theo index — phải đọc TEXT câu 1
+  // trên màn rồi match vào word-bank API. Live-verified: 90/100.
+  async function solveTransformTyping(qs, st) {
+    createIOEUI();
+    panelEl.classList.remove("hidden");
+    await ioeBridgeRequest("START_GAME", {}, 6000);
+    await sleep(2500);
+    showToast("🚀 Biến đổi câu: đang đọc màn hình game...");
+
+    const total = qs.length;
+    let solved = 0;
+    const seen = new Set();
+    for (let iter = 0; iter < total + 4; iter++) {
+      // 1. Đọc màn: câu 1 + skeleton câu 2 + số ô
+      const screenResp = await ioeBridgeRequest("READ_GAME_SCREEN", {}, 8000);
+      const screen = screenResp && screenResp.payload;
+      if (!screen || !screen.editboxes || !screen.editboxes.length) {
+        await sleep(2500);
+        continue;
+      }
+      const first = String(screen.first || "").trim();
+      if (!first || seen.has(first)) { await sleep(2000); continue; }
+      seen.add(first);
+      const blanks = screen.editboxes.length;
+
+      // 2. Match câu API theo text câu 1 (IOE xáo đề mỗi lần làm)
+      const nf = first.toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+      let bank = null;
+      for (const q of qs) {
+        const np = String(q.prompt || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+        if (np && (nf.startsWith(np.slice(0, 40)) || np.slice(0, 40).startsWith(nf.slice(0, 40)))) { bank = q.answers; break; }
+      }
+      if (!bank) {
+        const w5 = nf.split(" ").slice(0, 5).join(" ");
+        for (const q of qs) {
+          if (String(q.prompt || "").toLowerCase().includes(w5)) { bank = q.answers; break; }
+        }
+      }
+
+      // 3. AI đặt từ vào skeleton (hoặc map theo độ dài khi không có bank)
+      let words = null;
+      if (bank && bank.length) {
+        const promptLines = [
+          "BÀI BIẾN ĐỔI CÂU — đọc trực tiếp từ game:",
+          `Câu gốc: "${first}"`,
+          `Câu viết lại (ô trống dạng [B1], [B2], ...): "${screen.skeleton || ""}"`,
+          `Kho từ (dùng mỗi từ đúng 1 lần): ${bank.join(", ")}`
+        ];
+        const resp = await askAiForGame(promptLines.join("\n"), { examKind: "transform" });
+        const tag = (resp && resp.success) ? String(resp.data || "").match(/\[TRANSFORM_WORDS:\s*([^\]]+)\]/i) : null;
+        if (tag) {
+          const firstLine = tag[1].split(",")[0] || tag[1];
+          words = firstLine.split("|").map(w => w.replace(/^\d+[.):\-\s]+/, "").trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+        }
+      }
+      if (!words || words.length !== blanks) {
+        // Fallback: map theo độ dài mask — đúng khi các từ khác độ dài nhau
+        words = screen.editboxes.map(eb => {
+          const L = eb.maxLength || 0;
+          const used = new Set(words || []);
+          return (bank || []).find(a => String(a).length === L && !used.has(a)) || "";
+        });
+      }
+
+      // 4. Điền + bấm ANSWER
+      const fillResp = await ioeBridgeRequest("FILL_EDITBOXES", { texts: words }, 8000);
+      await sleep(getRandomHumanDelay(500, 900));
+      await ioeBridgeRequest("CLICK_ANSWER_BTN", {}, 8000);
+      solved++;
+      showToast(`✍️ Câu ${solved}/${total}: ${words.join(" | ")}`);
+      await sleep(getRandomHumanDelay(3500, 5000));
+    }
+    return solved > 0;
+  }
+
+  // =============== CLOZE CHIP SOLVER (cuon-giay-bi-an, Vòng 6 — 16/09/2026) ===============
+  // 1 câu duy nhất: đoạn văn 5 ô trống + 6 chip từ (1 từ nhiễu). Chip KHÔNG nhận
+  // mouse synthetic (live-caught) → NỘP TRỰC QUA CONTROLLER: set _lstSelect rồi
+  // onSubmitGame(). Live-verified: 100/100.
+  async function solveClozeChip(qs, st) {
+    createIOEUI();
+    panelEl.classList.remove("hidden");
+    await ioeBridgeRequest("START_GAME", {}, 6000);
+    await sleep(2500);
+    showToast("📖 Điền từ đoạn văn: đang đọc đề...");
+
+    // 1. Đọc màn: đoạn văn + word bank từ controller
+    const screenResp = await ioeBridgeRequest("READ_GAME_SCREEN", {}, 8000);
+    const screen = screenResp && screenResp.payload;
+    // passage: ghép RICHTEXT_CHILD của đoạn (READ_GAME_SCREEN gom vào first khi
+    // không có EditBox — cloze dùng chip chứ không có EditBox)
+    const passage = String((screen && screen.first) || "");
+    const blanks = (screen && screen.clozeBlanks) || 0;
+    let bank = (screen && screen.wordBank) || null;
+    if (!bank || !bank.length) bank = qs[0] && qs[0].answers;
+    if (!passage || !blanks || !bank || !bank.length) {
+      showToast("⚠️ Không đọc được đoạn văn điền từ — hãy F5 rồi thử lại.");
+      return false;
+    }
+
+    // 2. AI đặt từ
+    const promptLines = [
+      "BÀI ĐIỀN TỪ ĐOẠN VĂN — đoạn văn có các ô trống (1)____ ... (5)____:",
+      passage,
+      "",
+      `Kho từ (${bank.length} từ, mỗi từ dùng đúng 1 lần): ${bank.join(", ")}`,
+      `Cần điền ${blanks} ô trống.`
+    ];
+    const resp = await askAiForGame(promptLines.join("\n"), { examKind: "cloze" });
+    let words = null;
+    const tag = (resp && resp.success) ? String(resp.data || "").match(/\[CLOZE_WORDS:\s*([^\]]+)\]/i) : null;
+    if (tag) {
+      words = parseTagItems(tag[1]).map(w => String(w).trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+    }
+    if (!words || words.length < blanks) {
+      // fallback: khớp độ dài mask đã đọc từ các label "(n)____"
+      words = new Array(blanks).fill("");
+      for (let i = 0; i < blanks; i++) words[i] = bank[i % bank.length];
+    }
+
+    // 3. Nộp qua controller + xác nhận popup
+    const sub = await ioeBridgeRequest("SUBMIT_CLOZE", { words }, 10000);
+    const subPayload = sub && sub.payload;
+    if (!(subPayload && subPayload.ok)) {
+      showToast("⚠️ Không nộp được bài điền từ (" + ((subPayload && subPayload.reason) || "lỗi") + ").");
+      return false;
+    }
+    await sleep(1800);
+    // popup confirm "Bạn có chắc chắn muốn nộp bài không?" → bấm Đồng ý (btn_dongy
+    // bên phải). Đóng cả popup lỗi cũ (btn_OK) nếu còn.
+    await ioeBridgeRequest("CLICK_NAME", { name: "btn_OK" }, 6000);
+    await sleep(600);
+    await ioeBridgeRequest("CLICK_NAME", { name: "btn_dongy" }, 6000);
+    await sleep(2500);
+    showToast(`✅ Đã điền & nộp: ${words.join(" | ")}`);
+    renderFillWordsResult([{ prompt: "Đoạn văn" }].concat(new Array(blanks - 1).fill({})), words);
+    return true;
   }
 
   function renderFillWordsResult(qs, answers) {
@@ -556,6 +716,8 @@
 
     if (kind === "listening_fillword") return await solveAndTypeFillWords(qs, st);
     if (kind === "mcq_multi") return await solveAndClickMcqMulti(qs, st);
+    if (kind === "transform_typing") return await solveTransformTyping(qs, st);
+    if (kind === "cloze_chip") return await solveClozeChip(qs, st);
 
     return false; // listening_tf / unknown → caller falls back to the generic AI flow
   }
@@ -649,7 +811,7 @@
     ioeRootEl.innerHTML = `
       <div class="ioe-control-pill" id="ioe-pill-toggle">
         <div class="ioe-badge-icon">IOE</div>
-        <span class="ioe-pill-title">English Master v2.12.1</span>
+        <span class="ioe-pill-title">English Master v2.13.0</span>
         <span id="ioe-audio-detected-badge" class="ioe-audio-pill hidden" title="Phát hiện bài thi nghe">🎧 Audio</span>
         <span id="ioe-game-api-badge" class="ioe-api-pill hidden" title="Đã đọc đề trực tiếp từ API game">🎮 API</span>
         <div class="ioe-pill-btn-group">
