@@ -1,5 +1,5 @@
 /**
- * English Master AI - Background Service Worker v3.6
+ * English Master AI - Background Service Worker v3.7
  * Universal Game Type Classifier: True/False Listening • Matching Pairs • MCQ • Fill Blanks
  */
 
@@ -35,6 +35,9 @@ const FALLBACK_MODELS = [
 ];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// BUG#31: các tab đã attach debugger cho trusted click (giữ nguyên suốt phiên)
+const TRUSTED_CLICK_ATTACHED = new Set();
 
 const PROMPTS = {
   ioe_auto: `Bạn là trợ lý giải đề thi Olympic Tiếng Anh IOE (ioe.vn) siêu tốc và chính xác 100%.
@@ -388,6 +391,40 @@ function captureVisibleTabWithRetry(windowId, format = "png", retries = 2) {
 }
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // BUG#31 (live 17/09/2026, ghep-cap/an-khe-tra-vang — engine Cocos 2.0.0
+  // alpha): game CHỈ nhận TRUSTED input — synthetic DOM events bị bỏ qua hoàn
+  // toàn (live-verified: chuột thật qua CDP = ăn điểm, synthetic = 0 event).
+  // Click qua chrome.debugger Input.dispatchMouseEvent = trusted browser-level.
+  if (request.action === "TRUSTED_CLICK") {
+    const tabId = sender.tab ? sender.tab.id : null;
+    if (!tabId) { sendResponse({ ok: false, error: "no_tab" }); return; }
+    const x = Math.round(Number(request.x) || 0), y = Math.round(Number(request.y) || 0);
+    (async () => {
+      try {
+        const target = { tabId };
+        // Attach MỘT LẦN mỗi tab (giữ nguyên — tránh infobar debugger nhấp nháy
+        // mỗi click). Tab đóng → Chrome tự detach.
+        if (!TRUSTED_CLICK_ATTACHED.has(tabId)) {
+          try { await chrome.debugger.attach(target, "1.3"); TRUSTED_CLICK_ATTACHED.add(tabId); } catch (e) {
+            // "Already attached to target" → vẫn dùng được
+            if (/already attached/i.test(String(e && e.message || e))) TRUSTED_CLICK_ATTACHED.add(tabId);
+            else { sendResponse({ ok: false, error: String(e && e.message || e) }); return; }
+          }
+        }
+        for (const type of ["mousePressed", "mouseReleased"]) {
+          await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+            type, x, y, button: "left", buttons: type === "mousePressed" ? 1 : 0, clickCount: 1
+          });
+        }
+        sendResponse({ ok: true, x, y });
+      } catch (err) {
+        TRUSTED_CLICK_ATTACHED.delete(tabId);
+        sendResponse({ ok: false, error: String(err && err.message || err) });
+      }
+    })();
+    return true;
+  }
+
   if (request.action === "CAPTURE_TAB_ONLY") {
     const windowId = sender.tab ? sender.tab.windowId : null;
     captureVisibleTabWithRetry(windowId)

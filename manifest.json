@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "English Master AI - Trợ Lý Giải Bài Tiếng Anh & IOE",
-  "version": "3.6",
+  "version": "3.7",
   "description": "Giải bài tập tiếng Anh thông minh bằng AI: trắc nghiệm, điền từ, ghép cặp, bài nghe True/False trên IOE (ioe.vn) bằng Multimodal AI.",
   "permissions": [
     "storage",
     "activeTab",
     "contextMenus",
-    "tabs"
+    "tabs",
+    "debugger"
   ],
   "host_permissions": [
     "<all_urls>",

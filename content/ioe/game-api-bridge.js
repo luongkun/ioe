@@ -289,6 +289,23 @@
   function domClickAt(x, y) {
     const cv = getCanvas();
     if (!cv) return false;
+    // BUG#31 (engine Cocos 2.0.0 alpha — ghep-cap/an-khe-tra-vang, 17/09/2026):
+    // engine cũ bỏ qua HOÀN TOÀN synthetic DOM events (live-verify: 0 event).
+    // Với engine < 2.4 → click TRUSTED qua chrome.debugger (CDP Input) —
+    // content script chuyển tiếp sang service worker (xem __ioeTrustedClick).
+    // FIRE-AND-FORGET: không đợi reply (đợi đồng bộ sẽ đóng băng event loop →
+    // reply không bao giờ tới). Synthetic KHÔNG fire cho engine cũ (vô dụng
+    // và có thể gây double-click nếu engine bất ngờ nhận cả hai).
+    try {
+      const cc = getCC();
+      const ver = cc && cc.ENGINE_VERSION ? String(cc.ENGINE_VERSION) : "";
+      const m = ver.match(/(\d+)\.(\d+)/);
+      const old = m && (parseInt(m[1], 10) < 2 || (parseInt(m[1], 10) === 2 && parseInt(m[2], 10) < 4));
+      if (old) {
+        window.postMessage({ __ioeTrustedClick: true, reqId: "tc_" + Date.now() + "_" + Math.floor(Math.random() * 1e6), x: x, y: y }, window.location.origin);
+        return true;
+      }
+    } catch (e) {}
     try {
       // Touch trước (game Cocos 2.x chỉ nghe touch), mouse sau (game 3.x nghe cả hai;
       // fire kép không hại vì engine tự khử trùng theo pointerId/type).
@@ -301,6 +318,8 @@
       return true;
     } catch (e) { return false; }
   }
+
+
 
   // Click a Cocos node THE RELIABLE WAY — validated live on ioe.vn games:
   // 1) DOM MouseEvents at the node's screen position: the real Cocos canvas
