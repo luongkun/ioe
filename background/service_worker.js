@@ -1,5 +1,5 @@
 /**
- * English Master AI - Background Service Worker v3.5
+ * English Master AI - Background Service Worker v3.6
  * Universal Game Type Classifier: True/False Listening • Matching Pairs • MCQ • Fill Blanks
  */
 
@@ -253,6 +253,16 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
 
   if (examKind === "mcq_multi") {
     fullPrompt += "\n\n[CHÚ Ý: BÀI TRẮC NGHIỆM NHIỀU CÂU. Hãy giải TỪNG câu trong đề và trả về dòng đầu tiên theo định dạng [MCQ_ANSWERS: 1. B, 2. A, ...] với ĐỦ mọi câu!]";
+  }
+
+  // Dạng mới (live 17/09/2026, chim-hai-tao — Vòng 1): đọc hiểu True/False
+  if (examKind === "reading_tf") {
+    fullPrompt += "\n\n[CHÚ Ý: BÀI ĐỌC HIỂU TRUE/FALSE. Đối chiếu TỪNG câu khẳng định với ĐOẠN VĂN đã cung cấp: đúng theo đoạn văn → True, trái hoặc bịa thêm → False. Trả về dòng đầu tiên theo định dạng [TF_ANSWERS: 1. True, 2. False, ...] với ĐỦ mọi câu theo đúng thứ tự!]";
+  }
+
+  // Dạng mới (live 17/09/2026, bach-tuoc-thu-ngoc — Vòng 1): sắp xếp từ
+  if (examKind === "word_order") {
+    fullPrompt += "\n\n[CHÚ Ý: BÀI SẮP XẾP TỪ (word ordering). Sắp xếp các mảnh từ của TỪNG câu thành câu tiếng Anh đúng ngữ pháp, đúng nghĩa. Dùng CHÍNH XÁC từng mảnh từ như đề bài (giữ nguyên chính tả và dấu câu, KHÔNG sửa, KHÔNG thêm từ mới). Trả về dòng đầu tiên theo định dạng [WORD_ORDER: 1. mảnh | mảnh | mảnh, 2. mảnh | mảnh | mảnh, ...] với ĐỦ mọi câu, các mảnh của mỗi câu phân cách bằng dấu | !]";
   }
 
   // Dạng mới Vòng 6 (16/09/2026): biến đổi câu gõ từ + điền từ đoạn văn

@@ -426,12 +426,18 @@
 
   async function startGame() {
     let closed = 0, started = 0;
+    // 0. BUG#27 (live 17/09/2026, ang-noi): popup cảnh báo "Checking device"
+    //    (nút OK tên lạ) chặn toàn bộ input trên màn hướng dẫn — dismiss theo
+    //    dim-layer TRƯỚC (bất kể tên nút), rồi mới đến các bước theo tên.
+    try { closed += dismissSystemPopups(); } catch (e) {}
     // 1. Close intro/warning popups — the real games show a system-requirements
     //    dialog whose button is named btnOK (plus btn_close variants).
     //    btn_dongy / btn_OK: biến thể mới gặp ở thanh-pho-xanh & cuon-giay-bi-an
     //    (16/09/2026) — nút "đồng ý/OK" không có cc.Button component nên phải
     //    click bằng toạ độ (clickNode) thay vì chỉ emit("click").
-    const closedNames = ["btn_close", "btnClose", "btnOK", "ok_btn", "btn_ok", "btnOkay", "btn_dongy", "btn_OK"];
+    //    nameOK (17/09/2026, ang-noi): popup action đặt tên kiểu nameContinue/
+    //    nameSubmit → biến thể nameOK.
+    const closedNames = ["btn_close", "btnClose", "btnOK", "ok_btn", "btn_ok", "btnOkay", "btn_dongy", "btn_OK", "nameOK", "ok"];
     for (const nm of closedNames) {
       let n = null;
       try { n = findNodeByName(nm); } catch (e) {}
@@ -467,6 +473,30 @@
       let d = null;
       try { d = findNodeByName("btn_dongy"); } catch (e) {}
       if (d) { try { clickNode(d); started++; } catch (e) {} }
+    }
+    // 2c. BUG#27 (ang-noi): nút start TÊN KHÁC (không phải start_btn/btn_dongy).
+    //     Fallback GENERIC: mọi nút button đang active có tên/text giống
+    //     start/play/begin/bắt đầu → click cái NHỎ NHẤT trước (tránh container
+    //     full-screen — click giữa container có thể trúng thẻ đáp án).
+    if (started === 0) {
+      try {
+        const cands = [];
+        for (const n of allNodes()) {
+          if (!n || n.activeInHierarchy === false || !isButton(n)) continue;
+          const nm = String(n.name || "");
+          const txt = String(nodeText(n) || "").trim();
+          const startish = /^(start|play|begin|bat dau|bắt đầu)$/i.test(txt) || /^(btn[_-]?)?(start|play|begin)/i.test(nm) || /^name(start|play)$/i.test(nm);
+          if (!startish) continue;
+          const w = n.width || 0;
+          if (w > 0 && w < 700) cands.push(n); // bỏ qua container full-screen
+        }
+        if (cands.length) {
+          const n = cands.sort((a, b) => (a.width || 0) - (b.width || 0))[0];
+          try { n.emit("click"); started++; } catch (e) {}
+          await sleep(250);
+          try { clickNode(n); started++; } catch (e) {}
+        }
+      } catch (e) {}
     }
     // 3. The Windows-10 upgrade notice pops up a beat AFTER the start press —
     //    dismiss it right away or it swallows the first question's inputs.
@@ -505,18 +535,26 @@
     let done = 0, failed = 0;
     for (let i = 0; i < pairs.length; i++) {
       const a = pairs[i][0], b = pairs[i][1];
+      // BUG#25 (live 17/09/2026): modal lỗi hệ thống ("Mạng không ổn định" /
+      // "Thông báo") xuất hiện giữa chừng NUỐT mọi click — autoMatch vẫn báo
+      // hoàn thành nhưng server không ghi nhận cặp nào. Dismiss trước MỖI cặp
+      // (no-op rẻ khi không có popup) để cặp kế không bị no-op.
+      try { dismissSystemPopups(); } catch (e) {}
       // Wait for EACH card to be live before clicking — clicking a card that is
       // still animating in is a silent no-op and derails the whole round
       // (observed live: "Wrong attempt" cascade → score 0).
       const na = await waitForNodeByText(a, 6000);
       if (na) { clickNode(na); done++; }
       await sleep(getRandom(180, 320));
+      try { dismissSystemPopups(); } catch (e) {}
       // Pass na as the exclusion: when two cards share the same text (Q/A echo
       // pairs like "How do you do?"), the second click must land on the OTHER card.
       const nb = await waitForNodeByText(b, 4000, na || undefined);
       if (nb) { clickNode(nb); done++; }
       else failed++;
-      await sleep(getRandom(300, 500));
+      // BUG#25: nhịp chậm hơn giữa các cặp — AnswerCheck dồn dập khiến IOE server
+      // trả lỗi "Mạng không ổn định" (live: modal hiện ngay sau cặp đầu).
+      await sleep(getRandom(600, 950));
       window.postMessage({ __ioeBridge: true, type: "MATCH_PROGRESS", payload: { runId, pair: pairs[i], index: i, total: pairs.length, okA: !!na, okB: !!nb } }, window.location.origin);
     }
     window.postMessage({ __ioeBridge: true, type: "MATCH_DONE", payload: { runId, done, failed, total: pairs.length } }, window.location.origin);
@@ -766,13 +804,24 @@
         // "type but never submit" failure mode).
         const popupText = readActivePopupText();
         if (popupText && /nh\u1eadp \u0111\u1ee7|s\u1ed1 k\xfd t\u1ef1/i.test(popupText)) {
+          // BUG#30: popup validation phải được DISMISS ngay (nút "OK" — ảnh,
+          // không text) — không thì nó nuốt mọi click sau đó và game chết đứng.
+          try {
+            for (const nm of ["OK", "ok", "btnOK", "ok_btn", "btn_ok"]) {
+              const n = findNodeByName(nm);
+              if (n) { clickNode(n); break; }
+            }
+          } catch (e2) {}
           return { ok: false, reason: "validation_popup", popup: popupText, via: "controller.onKeyEnterPress", inputTxt: String(ctrl.inputTxt == null ? "" : ctrl.inputTxt) };
         }
         return { ok: true, via: "controller.onKeyEnterPress", inputTxt: String(ctrl.inputTxt == null ? "" : ctrl.inputTxt) };
       }
     } catch (e) {}
     // 1. Well-known button node names
-    const names = ["btn_answer", "btnAnswer", "answer_btn", "btnSubmit", "btn_submit", "submit_btn", "btnOK", "ok_btn", "btn_ok"];
+    const names = ["btn_answer", "btnAnswer", "answer_btn", "btnSubmit", "btn_submit", "submit_btn", "btnOK", "ok_btn", "btn_ok",
+      // BUG#30 (nh-tim, 17/09/2026): popup "Vui lòng nhập đủ số ký tự" có nút
+      // tên ĐÚNG "OK" — nút ẢNH không có text nên btnOK/ok_btn/text-search đều miss.
+      "OK", "ok"];
     for (const nm of names) {
       const n = findNodeByName(nm);
       if (n) { const ok = clickNode(n); if (ok) return { ok: true, via: "name:" + nm }; }
@@ -879,25 +928,138 @@
   // Text of the question currently ON SCREEN (active only), plus its number if a
   // "n/10"-style counter label is visible. Used by the solver to wait for the
   // next question's animation to finish before clicking the answer.
+
+  // BUG#26 (live 17/09/2026, chim-hai-tao): component "question controller"
+  // (currentQuestionNumber 0-based + askStrContent = câu hiện tại + desStrContent
+  // = đoạn văn + canClick) — nguồn đọc chính xác nhất cho game đọc hiểu TF.
+  // Cache tham chiếu vì currentQuestionInfo được poll liên tục (~200ms).
+  let _questCompCache = null;
+  function findQuestControllerComponent() {
+    try {
+      const c = _questCompCache;
+      if (c && c.node && c.node.activeInHierarchy !== false && c.isValid !== false) return c;
+      _questCompCache = null;
+    } catch (e) { _questCompCache = null; }
+    const cc = getCC();
+    if (!cc || !cc.director || !cc.director.getScene) return null;
+    let found = null;
+    (function walk(n) {
+      if (!n || found) return;
+      try { if (n.activeInHierarchy === false) return; } catch (e) {}
+      const comps = n._components || n.components;
+      if (comps) for (const c of comps) {
+        if (c && c.currentQuestionNumber !== undefined && typeof c.onButtonClick === "function") { found = c; return; }
+      }
+      const kids = n.children;
+      if (kids) for (let i = 0; i < kids.length; i++) walk(kids[i]);
+    })(cc.director.getScene());
+    _questCompCache = found;
+    return found;
+  }
+
+  // BUG#26 (chim-hai-tao): các ô chuyển câu chia sẻ tên node "btn_quest_item",
+  // phân biệt bằng label con "1".."N" — CLICK_TEXT "2" có thể trúng nút khác
+  // (số câu trùng số thứ tự đáp án MCQ). RPC riêng cho solver đọc hiểu TF.
+  function clickQuestItem(index) {
+    const cc = getCC();
+    if (!cc || !cc.director || !cc.director.getScene || index === undefined || index === null) return { ok: false, reason: "bad_args" };
+    const target = normText(String(index));
+    if (!target) return { ok: false, reason: "bad_args" };
+    let found = null;
+    (function walk(n) {
+      if (!n || found) return;
+      try { if (n.activeInHierarchy === false) return; } catch (e) {}
+      if (n.name === "btn_quest_item" && normText(nodeText(n)) === target) found = n;
+      const kids = n.children;
+      if (kids) for (let i = 0; i < kids.length; i++) walk(kids[i]);
+    })(cc.director.getScene());
+    if (!found) return { ok: false, reason: "no_item_" + target };
+    return clickNode(found) ? { ok: true } : { ok: false, reason: "click_failed" };
+  }
+
+  // BUG#26 (chim-hai-tao): nút game có tên kèm hậu tố editor ("btnTrue copy") —
+  // CLICK_NAME exact "btnTrue" luôn thất bại. Thử exact → prefix ("btnTrue ") →
+  // contains; trả về tên node đã click để solver ghi log.
+  function clickNameSmart(name) {
+    if (!name) return { ok: false, reason: "no_name" };
+    let n = findNodeByName(name);
+    let via = "exact";
+    if (!n) {
+      for (const x of allNodes()) {
+        if (x && x.activeInHierarchy !== false && typeof x.name === "string" && x.name.startsWith(name + " ")) { n = x; via = "prefix"; break; }
+      }
+    }
+    if (!n) {
+      for (const x of allNodes()) {
+        if (x && x.activeInHierarchy !== false && typeof x.name === "string" && x.name !== name && x.name.includes(name)) { n = x; via = "contains"; break; }
+      }
+    }
+    if (!n) return { ok: false, reason: "not_found" };
+    return clickNode(n) ? { ok: true, node: n.name, via } : { ok: false, reason: "click_failed" };
+  }
   function currentQuestionInfo() {
     const cc = getCC();
     const labels = scanLabels();
     const out = { text: "", qnum: null, raw: labels.length };
 
-    // 1. Find a "3/10", "Câu 3/10" or "3 / 10" style counter
+    // 0. BUG#26 (chim-hai-tao): question controller component — qnum/ask/des/
+    //    canClick chính xác 100%, ưu tiên trước mọi heuristic label.
+    try {
+      const qc = findQuestControllerComponent();
+      if (qc) {
+        if (qc.currentQuestionNumber !== undefined && qc.currentQuestionNumber !== null && /^\d+$/.test(String(qc.currentQuestionNumber))) {
+          out.qnum = parseInt(String(qc.currentQuestionNumber), 10) + 1; // 1-based như label "n/total"
+        }
+        const strip = (s) => String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        const ask = strip(qc.askStrContent);
+        if (ask) out.ask = ask;
+        const des = strip(qc.desStrContent);
+        if (des) out.des = des;
+        if (qc.canClick !== undefined) out.canClick = !!qc.canClick;
+      }
+    } catch (e) {}
+
+    // 1a. Separate counter labels (live 17/09/2026, bach-tuoc-thu-ngoc):
+    //     lblCurrent "1" + lbl_total_quest "10" — hai label RỜI, không có
+    //     dạng "1/10" nên regex bên dưới không bao giờ khớp → qnum null →
+    //     solver không phát hiện được game đã chuyển câu (gốc BUG#24).
+    const META_NODE = /^(lblName|lblID|lbLevel|lblScore|lblTimer|lblVersion)$/i;
     for (const l of labels) {
-      const m = String(l.text || "").match(/(?:c\u00e2u\s*)?(\d+)\s*\/\s*(\d+)/i);
-      if (m) { out.qnum = parseInt(m[1]); out.total = parseInt(m[2]); break; }
+      if (l.node === "lblCurrent" && /^\d+$/.test(String(l.text || "").trim())) {
+        out.qnum = parseInt(String(l.text).trim(), 10);
+      } else if (/^(lbl_total_quest|lblTotalQuest|lbl_total|total_quest)$/i.test(l.node || "") && /^\d+$/.test(String(l.text || "").trim())) {
+        out.total = parseInt(String(l.text).trim(), 10);
+      }
+    }
+
+    // 1b. Find a "3/10", "Câu 3/10" or "3 / 10" style counter
+    if (out.qnum === null) {
+      for (const l of labels) {
+        const m = String(l.text || "").match(/(?:c\u00e2u\s*)?(\d+)\s*\/\s*(\d+)/i);
+        if (m) { out.qnum = parseInt(m[1]); out.total = parseInt(m[2]); break; }
+      }
     }
 
     // 2. Longest visible label = the question statement (statement is longer
     //    than buttons/counters/audio hints like "Click to replay").
+    //    LOẠI TRỪ label meta: tên người chơi ("Nguyễn Thế Lương") đủ dài và
+    //    lọt vào heuristic cũ → "text" không bao giờ đổi giữa các câu.
     let best = "";
     for (const l of labels) {
+      if (META_NODE.test(l.node || "")) continue;
       const t = String(l.text || "").trim();
       if (t.length > best.length && t.length >= 15) best = t;
     }
     out.text = best;
+
+    // 3. BUG#26: signature = join RICHTEXT_CHILD (statement + passage) — đổi
+    // khi statement đổi (passage giữ nguyên giữa các câu) → detector chuyển
+    // câu cho game KHÔNG có counter và component (label-only games).
+    let sig = "";
+    for (const l of labels) {
+      if (l.node === "RICHTEXT_CHILD") sig += (sig ? " " : "") + String(l.text || "");
+    }
+    out.sig = sig.slice(0, 500);
     return out;
   }
 
@@ -1113,6 +1275,48 @@
     return { ok: false };
   }
 
+  // BUG#30c (nh-tim/hanh-tinh-tim transform, 17/09/2026): nút ANSWER của game
+  // biến đổi câu = controller.onKeyEnterPress — nhưng validation isAnswerAll()
+  // đòi MỖI từ phải dài ĐÚNG maxLength của ô (live-verified: 'aaa' vào ô
+  // maxLength 8 → "Vui lòng nhập đủ số ký tự" → game kẹt cả bài). Đường chuẩn:
+  // set từng EditBox theo ddv.results + gọi ctrl.onKeyEnterPress() trực tiếp
+  // (callApiAnswer bên trong) — verified: AnswerCheck bay + chuyển câu ngay.
+  function submitTransform(words) {
+    try { dismissSystemPopups(); } catch (e) {}
+    const cc = getCC();
+    const ctrl = findQuestionController();
+    if (!ctrl || !ctrl.dienDoanVan || !ctrl.dienDoanVan.results || !cc || !cc.EditBox) {
+      return { ok: false, reason: "no_controller" };
+    }
+    const ddv = ctrl.dienDoanVan;
+    const out = [];
+    try {
+      for (let i = 0; i < ddv.results.length; i++) {
+        const eb = ddv.results[i].getComponent(cc.EditBox);
+        if (!eb) continue;
+        const ml = eb.maxLength || 0;
+        let w = String((words || [])[i] || "");
+        // Từ sai độ dài → placeholder đúng maxLength: isAnswerAll đòi ĐÚNG từng ô,
+        // 1 ô sai = KHÔNG nộp được cả câu (kẹt game). Placeholder giúp câu vẫn
+        // nộp (điểm 0 cho câu đó) và game tiếp tục.
+        if (!w.length || (ml > 0 && w.length !== ml)) w = "x".repeat(Math.max(1, ml));
+        eb.string = w;
+        out.push(w);
+      }
+      if (!ddv.isAnswerAll || !ddv.isAnswerAll()) {
+        return { ok: false, reason: "not_all_filled", filled: out };
+      }
+    } catch (e) {
+      return { ok: false, reason: "fill_err:" + (e && e.message) };
+    }
+    try {
+      ctrl.onKeyEnterPress();
+      return { ok: true, submitted: out };
+    } catch (e) {
+      return { ok: false, reason: "enter_err:" + (e && e.message) };
+    }
+  }
+
   window.addEventListener("message", async (ev) => {
     if (ev.source && ev.source !== window) return;
     const d = ev.data;
@@ -1140,7 +1344,10 @@
           reply(reqId, "CLICK_TEXT_OK", { ok: clickNode(findNodeByText((d.data || {}).text, { contains: !!(d.data || {}).contains })) });
           break;
         case "CLICK_NAME":
-          reply(reqId, "CLICK_NAME_OK", { ok: clickNode(findNodeByName((d.data || {}).name)) });
+          reply(reqId, "CLICK_NAME_OK", clickNameSmart((d.data || {}).name));
+          break;
+        case "CLICK_QUEST_ITEM":
+          reply(reqId, "CLICK_QUEST_ITEM_OK", clickQuestItem((d.data || {}).index));
           break;
         case "AUTO_MATCH":
           reply(reqId, "AUTO_MATCH_STARTED", { total: ((d.data || {}).pairs || []).length });
@@ -1178,6 +1385,9 @@
           break;
         case "SUBMIT_CLOZE":
           reply(reqId, "SUBMIT_CLOZE_OK", submitCloze((d.data || {}).words));
+          break;
+        case "SUBMIT_TRANSFORM":
+          reply(reqId, "SUBMIT_TRANSFORM_OK", submitTransform((d.data || {}).words));
           break;
         case "CLICK_ANSWER_BTN":
           reply(reqId, "CLICK_ANSWER_BTN_OK", clickAnswerButton());

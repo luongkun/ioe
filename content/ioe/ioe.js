@@ -1,5 +1,5 @@
 /**
- * English Master AI - Dedicated IOE Universal Game Solver v3.5
+ * English Master AI - Dedicated IOE Universal Game Solver v3.6
  * Supports: True/False Listening (Dọn rác bãi biển), Matching Pairs (Ghép Cặp 12 ô), MCQ (Tái tạo san hô, Fansipan, Leo núi), Long Reading Passage Auto-Scroll & Extraction
  */
 
@@ -7,7 +7,7 @@
   if (window.__IOE_MASTER_LOADED__) return;
   window.__IOE_MASTER_LOADED__ = true;
 
-  console.log("%c[English Master AI v3.5] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
+  console.log("%c[English Master AI v3.6] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
 
   // 1. Super Unblocker
   function superUnblockAll() {
@@ -33,11 +33,14 @@
   // 1.5 GAME API BRIDGE (Cocos Creator IOE games) - receives exact exam JSON
   let gameBridgeState = null;
   let gameBridgeError = null;
+  let lastMatchDoneInfo = null;
+  let lastFinishGameAt = 0; // BUG#29: track FINISHGAME để biết game đã nộp/chấm xong
 
   window.addEventListener("message", (ev) => {
     if (ev.source !== window) return;
     const d = ev.data;
     if (!d || !d.__ioeBridge) return;
+    if (d.type === "FINISHGAME") lastFinishGameAt = Date.now();
     if (d.type === "GETINFO" || d.type === "SYNC") {
       gameBridgeState = d.payload || null;
       gameBridgeError = null;
@@ -57,6 +60,10 @@
       showToast("⚠️ API game từ chối (token mỗi lần chỉ dùng 1 lần). Hãy tải lại trang (F5) rồi bấm Tự Làm lại.");
     } else if (d.type === "ANSWERCHECK") {
       if (gameBridgeState) gameBridgeState.lastAnswerCheck = d.payload;
+    } else if (d.type === "MATCH_DONE") {
+      // BUG#25: AUTO_MATCH RPC trả lời ngay STARTED — kết quả thật (done/failed)
+      // đến qua event này. Lưu lại để solver biết có cặp chưa ăn để retry.
+      lastMatchDoneInfo = d.payload || null;
     }
   });
 
@@ -126,7 +133,7 @@
   // Classify from the ACTUAL API payload (mask/answers/tans/format/audio) — NOT from
   // the game URL or name — so a NEW game type or the "same exam in a different
   // form" is still recognised correctly every time.
-  function classifyExam(qs) {
+  function classifyExam(qs, st) {
     if (!qs || !qs.length) return "unknown";
     const allF25 = qs.every(q => q.format === 25);
     const allListening = qs.every(q => q.isListening && q.audio);
@@ -135,17 +142,42 @@
     const withOptions = qs.filter(q => q.answers && q.answers.length >= 2);
     const textPairs = deriveMatchPairsFromGameApi();
 
+    // ===== Dạng mới (live 17/09/2026, bach-tuoc-thu-ngoc — Vòng 1): SẮP XẾP TỪ =====
+    // gameDesc hướng dẫn "đặt từ đúng thứ tự" + mọi câu có answers là các mảnh
+    // từ xáo trộn. Phải click tile THEO THỨ TỰ rồi submit — KHÔNG phải chọn 1
+    // trong N như mcq_multi (BUG#23: phân loại nhầm → click 1 từ/câu → kẹt game).
+    const gdWordOrder = String((st && st.gameDesc) || "");
+    if (withOptions.length === qs.length && /right\s+order|correct\s+order|putting\s+the\s+words|s\u1eafp\s*x\u1ebfp/i.test(gdWordOrder)) return "word_order";
+
     // ===== 2 dạng mới gặp ở Vòng 6 (live 16/09/2026) =====
     // * transform_typing (hanh-tinh-tim): format 19 + type 3 — biến đổi câu
     //   "It is important that..." → gõ "must be careful" vào EditBox. API trả
     //   sẵn word-bank (bị xáo trộn) trong answers, cần AI đặt theo ngữ pháp.
-    const allF19T3 = qs.every(q => q.format === 19 && q.type === 3);
-    if (allF19T3 && withOptions.length === qs.length) return "transform_typing";
+    //   BUG#30 (nh-tim, Vòng 2 — 17/09/2026): IOE trả LỘN format — 1 câu format 0
+    //   lẫn giữa 9 câu format 19 → every() fail → classify nhầm mcq_multi →
+    //   click đáp án thay vì gõ → popup "Vui lòng nhập đủ số ký tự" chặn game.
+    //   Nới thành ngưỡng 80% (mọi câu vẫn phải có word-bank trong answers).
+    const f19t3Count = qs.filter(q => q.format === 19 && q.type === 3).length;
+    const mostlyF19T3 = f19t3Count / qs.length >= 0.8;
+    if (mostlyF19T3 && withOptions.length === qs.length) return "transform_typing";
     // * cloze_chip (cuon-giay-bi-an): 1 câu duy nhất, prompt là word-bank phân
     //   cách bằng "|" ("every|all|by|called|took|scored") — điền từ vào đoạn văn
     //   bằng cách chọn chip; nộp qua controller (submitCloze).
     const pipeBank = qs.length === 1 && /^\s*\w+(\|\w+)+\s*$/.test(String(qs[0].prompt || ""));
     if (pipeBank) return "cloze_chip";
+
+    // ===== Dạng mới (live 17/09/2026, chim-hai-tao — Vòng 1): ĐỌC HIỂU TRUE/FALSE =====
+    // Mọi câu: KHÔNG audio (không phải nghe), KHÔNG answers/tans (không phải
+    // MCQ/ghép cặp), KHÔNG mask (không phải điền từ), prompt là câu khẳng định
+    // trọn vẹn → chọn True/False TỪNG câu qua ô chuyển câu (btn_quest_item),
+    // xong hết bấm nộp CẢ BÀI (btnSubmit → popup nameSubmit).
+    // (BUG#26: trước đây rơi "unknown" → screen path → screenshot + click
+    // toạ độ % cũ trượt → game kẹt câu 1, điểm 0.)
+    const sentenceLike = qs.every(q => {
+      const p = String(q.prompt || "").trim();
+      return p.length >= 20 && p.includes(" ") && /[.?!]$/.test(p);
+    });
+    if (!withTans.length && !withOptions.length && !allMasked && !allListening && qs.length >= 2 && sentenceLike) return "reading_tf";
 
     // Thứ tự quan trọng: lựa chọn (options) / đáp án sẵn (tans) được xét TRƯỚC
     // mask — đề trắc nghiệm có stem "______" không bị nhận nhầm thành điền từ.
@@ -271,6 +303,286 @@
     return lines.join("\n");
   }
 
+  // =============== WORD-ORDER SOLVER (sắp xếp từ thành câu — BUG#23) ===============
+  // Live-verified 17/09/2026 trên bach-tuoc-thu-ngoc (Vòng 1, tài khoản test):
+  // mỗi câu có ~5 mảnh từ xáo trộn trong answers; click tile THEO ĐÚNG THỨ TỰ
+  // (CLICK_TEXT) rồi CONFIRM_ANSWER → +10 điểm/câu, game tự chuyển câu.
+
+  function normTileForMatch(s) {
+    return String(s || "").toLowerCase()
+      .replace(/[\u2019\u2018`\u00b4]/g, "'")
+      .replace(/[\u201c\u201d]/g, '"')
+      .replace(/[\u2013\u2014]/g, "-")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function buildWordOrderPrompt(qs, indices, st) {
+    const lines = [];
+    lines.push("ĐỀ THI SẮP XẾP TỪ — đọc trực tiếp từ API GAME IOE (chính xác 100%, không cần OCR):");
+    if (st && st.gameDesc) lines.push("Hướng dẫn game: " + st.gameDesc);
+    lines.push("");
+    lines.push(`Tổng số câu: ${indices.length}`);
+    lines.push("");
+    indices.forEach((qi, k) => {
+      const q = qs[qi];
+      lines.push(`Câu ${k + 1}: ${q.prompt || "(sắp xếp các mảnh từ dưới đây thành câu đúng)"}`);
+      lines.push("  Các mảnh từ (ĐÃ XÁO TRỘN): " + (q.answers || []).map(a => `[${a}]`).join(" "));
+    });
+    lines.push("");
+    lines.push(`YÊU CẦU: Sắp xếp các mảnh từ của TỪNG câu thành câu tiếng Anh đúng ngữ pháp, đúng nghĩa. Dùng CHÍNH XÁC từng mảnh từ như đề bài (giữ nguyên chính tả và dấu câu, KHÔNG sửa, KHÔNG thêm từ mới). Trả về dòng đầu tiên ĐÚNG định dạng: [WORD_ORDER: 1. mảnh | mảnh | mảnh, 2. mảnh | mảnh | mảnh, ...] với ĐỦ ${indices.length} câu, các mảnh của mỗi câu phân cách bằng dấu | .`);
+    return lines.join("\n");
+  }
+
+  // "[WORD_ORDER: 1. a | b | c, 2. d | e]" → orders[qi] = [tile gốc từ API...]
+  // Match mảnh AI trả về với tile GỐC (normalize dấu nháy ’/'), click bằng text
+  // GỐC — AI hay trả apostrophe thẳng trong khi tile dùng ’ (curly).
+  function parseWordOrderTag(raw, qs) {
+    const tag = String(raw || "").match(/\[WORD_ORDER:\s*([^\]]+)\]/i);
+    if (!tag) return null;
+    const inner = tag[1];
+    // Tách theo "N." — mảnh có thể chứa dấu phẩy ("However,") nên không split comma
+    const chunks = inner.split(/(?=\b\d+\s*[.)]\s)/).map(s => s.trim()).filter(Boolean);
+    const orders = new Array(qs.length).fill(null);
+    for (const chunk of chunks) {
+      const m = chunk.match(/^(\d+)\s*[.)]\s*(.+)$/);
+      if (!m) continue;
+      const qn = parseInt(m[1], 10);
+      const qi = qn - 1;
+      if (qi < 0 || qi >= qs.length || orders[qi]) continue;
+      const frags = m[2].split(/\s*\|\s*/).map(s => s.trim()).filter(Boolean);
+      const tiles = qs[qi].answers || [];
+      const used = new Set();
+      const seq = [];
+      let unmatched = 0;
+      for (const f of frags) {
+        const nf = normTileForMatch(f);
+        let matched = -1;
+        for (let t = 0; t < tiles.length; t++) {
+          if (used.has(t)) continue;
+          if (normTileForMatch(tiles[t]) === nf) { matched = t; break; }
+        }
+        if (matched < 0 && nf) {
+          // chứa nhau thì chấp nhận (AI gộp/sửa nhẹ dấu câu)
+          for (let t = 0; t < tiles.length; t++) {
+            if (used.has(t)) continue;
+            const nt = normTileForMatch(tiles[t]);
+            if (nt && (nt.includes(nf) || nf.includes(nt))) { matched = t; break; }
+          }
+        }
+        if (matched >= 0) { used.add(matched); seq.push(tiles[matched]); }
+        else unmatched++;
+      }
+      // Mảnh AI bỏ sót → nối tile còn lại theo thứ tự API để câu ĐỦ từ
+      // (thiếu từ = game kẹt validation, không chuyển câu)
+      for (let t = 0; t < tiles.length; t++) {
+        if (!used.has(t)) { used.add(t); seq.push(tiles[t]); unmatched++; }
+      }
+      if (unmatched) console.warn(`[English Master AI] ⚠️ Câu ${qn}: ${unmatched} mảnh không khớp — tự bổ sung theo thứ tự API`);
+      if (seq.length) orders[qi] = seq;
+    }
+    return orders;
+  }
+
+  function renderWordOrderResult(qs, orders) {
+    const contentBox = ioeRootEl && ioeRootEl.querySelector("#ioe-panel-content");
+    if (!contentBox) return;
+    const chips = orders.map((seq, i) => {
+      if (!seq) return `<span class="ioe-slot-chip" style="background:#fee2e2; border-color:#ef4444;">Câu ${i + 1}: <strong>?</strong></span>`;
+      return `<span class="ioe-slot-chip" style="background:#dcfce7; border-color:#10b981;">Câu ${i + 1}: <strong>${escapeHtml(seq.join(" "))}</strong></span>`;
+    }).join("");
+    contentBox.innerHTML = `
+      <div class="ioe-ans-banner">
+        <div class="ioe-ans-label"><span>🔤 KẾT QUẢ SẮP XẾP TỪ (${qs.length} CÂU)</span></div>
+        <div class="ioe-slot-chips">${chips}</div>
+      </div>
+    `;
+  }
+
+  async function solveWordOrder(qs, st) {
+    createIOEUI();
+    panelEl.classList.remove("hidden");
+    // Start BEFORE the AI call — intro screen hết hạn nhanh (xem solveAndTypeFillWords)
+    await ioeBridgeRequest("START_GAME", {}, 6000);
+
+    showToast(`🔤 Sắp xếp từ ${qs.length} câu: AI đang giải...`);
+    const resp = await askAiForGame(buildWordOrderPrompt(qs, qs.map((_, i) => i), st), { examKind: "word_order" });
+    if (!resp || !resp.success) {
+      renderAiFailurePanel(resp && resp.error, `sắp xếp từ ${qs.length} câu`);
+      showToast("❌ Không giải được — xem hướng dẫn trong panel");
+      return false;
+    }
+    const orders = parseWordOrderTag(resp.data, qs);
+    if (!orders || !orders.some(Boolean)) {
+      renderAiFailurePanel("AI trả lời không đúng định dạng [WORD_ORDER: 1. a | b | c, ...] — bấm Tự Làm để thử lại.", `sắp xếp từ ${qs.length} câu`);
+      showToast("❌ AI trả sai định dạng — bấm Tự Làm thử lại");
+      return false;
+    }
+
+    renderWordOrderResult(qs, orders);
+
+    const total = qs.length;
+    const done = await runPerQuestionActions(total, async (i) => {
+      const seq = orders[i];
+      if (!seq || !seq.length) return false;
+      let clicked = 0;
+      for (const tile of seq) {
+        let ok = false;
+        for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+          const r = await ioeBridgeRequest("CLICK_TEXT", { text: tile, contains: true }, 12000);
+          ok = !!(r && r.payload && r.payload.ok);
+          if (!ok) await sleep(700);
+        }
+        if (ok) clicked++;
+        await sleep(getRandomHumanDelay(600, 1000));
+      }
+      await sleep(getRandomHumanDelay(350, 700));
+      const conf = await ioeBridgeRequest("CONFIRM_ANSWER", {}, 12000);
+      const confOk = !!(conf && conf.payload && conf.payload.ok);
+      showToast(`🔤 Câu ${i + 1}/${total}: đặt ${clicked}/${seq.length} mảnh${confOk ? " + nộp" : " (chưa nộp được)"}`);
+      return clicked > 0;
+    }, "🔤 Sắp xếp từ xong");
+
+    return done > 0;
+  }
+
+  // =============== READING TRUE/FALSE SOLVER (BUG#26 — chim-hai-tao, Vòng 1) ===============
+  // Game đọc hiểu True/False: KHÔNG tự chuyển câu sau khi chọn — phải bấm ô
+  // chuyển câu (btn_quest_item "1".."N") cho TỪNG câu, chọn True/False, xong
+  // hết bấm nộp CẢ BÀI (btnSubmit) → popup "Bạn có chắc chắn muốn nộp bài
+  // không?" → nameSubmit → endGame → FINISHGAME. (Live-verify 17/09/2026:
+  // 4/4 câu đúng, finishgame 200, score 100.)
+
+  // "[TF_ANSWERS: 1. True, 2. False, ...]" → boolean[] đủ `total` phần tử
+  function parseTfAnswersTag(raw, total) {
+    const tag = String(raw || "").match(/\[TF_ANSWERS:\s*([^\]]+)\]/i);
+    if (!tag) return null;
+    const inner = tag[1];
+    const arr = new Array(total).fill(null);
+    const numbered = inner.match(/(\d+)\s*[.\):\u2013-]\s*(true|false)/gi);
+    if (numbered && numbered.length) {
+      for (const tok of numbered) {
+        const m = tok.match(/(\d+)\s*[.\):\u2013-]\s*(true|false)/i);
+        const idx = parseInt(m[1], 10);
+        if (idx >= 1 && idx <= total) arr[idx - 1] = m[2].toLowerCase() === "true";
+      }
+    } else {
+      const toks = inner.split(/[,;]+/).map(s => s.trim()).filter(Boolean);
+      toks.forEach((t, i) => { if (i < total) arr[i] = t.toLowerCase().startsWith("t"); });
+    }
+    if (!arr.some(v => v !== null)) return null;
+    // Câu thiếu mặc định True — nhất quán với listening TF (khẳng định thường đúng)
+    return arr.map(v => (v === null ? true : v));
+  }
+
+  // Đợi màn hình đang hiển thị đúng câu target (1-based): component qnum là
+  // chính xác nhất; fallback so text statement với prompt API.
+  async function waitReadingTfQuestion(target1b, promptText, timeoutMs = 9000) {
+    const t0 = Date.now();
+    const pTxt = String(promptText || "").toLowerCase().slice(0, 24);
+    let last = null;
+    while (Date.now() - t0 < timeoutMs) {
+      const r = await ioeBridgeRequest("CURRENT_QUESTION", {}, 5000);
+      const pl = (r && r.payload) || {};
+      last = pl;
+      if (pl.qnum === target1b) return { ok: true, info: pl };
+      if (pTxt && pl.ask && String(pl.ask).toLowerCase().includes(pTxt)) return { ok: true, info: pl };
+      await sleep(400);
+    }
+    return { ok: false, info: last };
+  }
+
+  async function solveReadingTfExam(qs, st) {
+    createIOEUI();
+    panelEl.classList.remove("hidden");
+    // Start BEFORE the AI call — intro screen hết hạn nhanh
+    await ioeBridgeRequest("START_GAME", {}, 6000);
+
+    // Passage từ component game (chính xác hơn OCR screenshot)
+    const infoResp = await ioeBridgeRequest("CURRENT_QUESTION", {}, 6000);
+    const passage = String((infoResp && infoResp.payload && infoResp.payload.des) || "").trim();
+
+    showToast(`📖 Đọc hiểu True/False ${qs.length} câu: AI đang giải...`);
+    const lines = [];
+    lines.push("BÀI ĐỌC HIỂU TRUE/FALSE — đề đọc trực tiếp từ API GAME IOE (chính xác 100%, không cần OCR):");
+    if (st && st.gameDesc) lines.push("Hướng dẫn game: " + st.gameDesc);
+    lines.push("");
+    lines.push("ĐOẠN VĂN (passage):");
+    lines.push(passage || "(không đọc được đoạn văn từ game — hãy suy luận từ nội dung các câu khẳng định)");
+    lines.push("");
+    lines.push(`CÁC CÂU KHẮNG ĐỊNH (xác định True hay False, tổng ${qs.length} câu):`);
+    qs.forEach((q, i) => lines.push(`Câu ${i + 1}: ${q.prompt}`));
+    lines.push("");
+    lines.push(`YÊU CẦU: Đối chiếu TỪNG câu khẳng định với đoạn văn để xác định True (đúng theo đoạn văn) hay False (trái với đoạn văn). Trả về dòng đầu tiên ĐÚNG định dạng: [TF_ANSWERS: 1. True, 2. False, ...] với ĐỦ ${qs.length} câu theo đúng thứ tự.`);
+    const resp = await askAiForGame(lines.join("\n"), { examKind: "reading_tf" });
+    if (!resp || !resp.success) {
+      renderAiFailurePanel(resp && resp.error, `đọc hiểu True/False ${qs.length} câu`);
+      showToast("❌ Không giải được — xem hướng dẫn trong panel");
+      return false;
+    }
+    const answers = parseTfAnswersTag(resp.data, qs.length);
+    if (!answers) {
+      renderAiFailurePanel("AI trả lời không đúng định dạng [TF_ANSWERS: 1. True, 2. False, ...] — bấm Tự Làm để thử lại.", `đọc hiểu True/False ${qs.length} câu`);
+      showToast("❌ AI trả sai định dạng — bấm Tự Làm thử lại");
+      return false;
+    }
+
+    // render kết quả
+    const chips = answers.map((v, i) => `<span class="ioe-slot-chip" style="${v ? "background:#dcfce7; border-color:#10b981;" : "background:#fee2e2; border-color:#ef4444;"}">Câu ${i + 1}: <strong>${v ? "True" : "False"}</strong></span>`).join("");
+    const contentBox = document.getElementById("ioe-panel-content");
+    if (contentBox) {
+      contentBox.innerHTML = `
+        <div class="ioe-ans-banner">
+          <div class="ioe-ans-label"><span>📖 KẾT QUẢ ĐỌC HIỂU TRUE/FALSE (${qs.length} CÂU)</span></div>
+          <div class="ioe-slot-chips">${chips}</div>
+        </div>
+      `;
+    }
+
+    // Click từng câu: ô chuyển câu → đợi hiển thị → chọn True/False
+    let done = 0;
+    for (let i = 0; i < qs.length; i++) {
+      if (i > 0) {
+        await ioeBridgeRequest("CLICK_QUEST_ITEM", { index: i + 1 }, 8000);
+        const w = await waitReadingTfQuestion(i + 1, qs[i].prompt, 9000);
+        if (!w.ok) showToast(`⏳ Câu ${i + 1}: màn hình chưa xác nhận chuyển câu — vẫn thử chọn đáp án`);
+        await sleep(getRandomHumanDelay(500, 900));
+      }
+      let ok = false;
+      const r1 = await ioeBridgeRequest("CLICK_NAME", { name: answers[i] ? "btnTrue" : "btnFalse" }, 8000);
+      if (r1 && r1.payload && r1.payload.ok) ok = true;
+      if (!ok) {
+        const r2 = await ioeBridgeRequest("CLICK_TEXT", { text: answers[i] ? "True" : "False", contains: true }, 8000);
+        ok = !!(r2 && r2.payload && r2.payload.ok);
+      }
+      if (ok) {
+        done++;
+        showToast(`📖 Câu ${i + 1}/${qs.length}: đã chọn [${answers[i] ? "True" : "False"}]`);
+      } else {
+        showToast(`⚠️ Câu ${i + 1}/${qs.length}: chưa click được nút ${answers[i] ? "True" : "False"} — bấm Giải lại (F2)`);
+      }
+      await sleep(getRandomHumanDelay(600, 1100));
+    }
+
+    // Nộp CẢ BÀI: btnSubmit → popup xác nhận → nameSubmit
+    const s1 = await ioeBridgeRequest("CLICK_NAME", { name: "btnSubmit" }, 8000);
+    await sleep(1800); // popup xác nhận hiện
+    let submitted = false;
+    for (let attempt = 0; attempt < 3 && !submitted; attempt++) {
+      const s2 = await ioeBridgeRequest("CLICK_NAME", { name: "nameSubmit" }, 8000);
+      if (s2 && s2.payload && s2.payload.ok) {
+        submitted = true;
+      } else {
+        await sleep(1800);
+        if (attempt === 1) await ioeBridgeRequest("CLICK_NAME", { name: "btnSubmit" }, 8000); // popup có thể chưa mở → bấm lại
+      }
+    }
+    if (submitted) showToast(`✅ Đã chọn ${done}/${qs.length} câu + nộp bài! Chờ game chấm...`);
+    else showToast(`📖 Đã chọn ${done}/${qs.length} câu — không thấy nút xác nhận nộp, hãy nộp thủ công nếu cần`);
+    console.log("[English Master AI] 📖 Reading TF:", JSON.stringify({ done, submitted, answers }));
+    return done > 0;
+  }
+
   // Wait until the on-screen question is fully rendered (counter or long text)
   async function waitForQuestionReady(timeoutMs = 12000) {
     const t0 = Date.now();
@@ -291,20 +603,30 @@
   async function runPerQuestionActions(total, actionFn, label) {
     let lastQinfo = await waitForQuestionReady();
     let done = 0;
+    // BUG#29b: game MCQ dạng LƯỚI (nh-tim — tất cả câu trên 1 màn, click không
+    // đổi màn hình) → mọi lần chờ "chuyển câu" đều đốt full 15s mà không có gì
+    // đổi. Sau 2 lần chờ đầy liên tiếp không thay đổi → game là dạng lưới →
+    // các câu sau chỉ chờ ngắn kiểu người (2.2-3.2s). Cắt 10 câu từ ~4 phút
+    // xuống ~1.5 phút (vượt timeout runner khi còn đang giải).
+    let gridNoChange = 0;
     for (let i = 0; i < total; i++) {
       let ok = false;
       try { ok = await actionFn(i); } catch (e) { console.warn("[English Master AI] per-question action error:", e); }
       if (ok) done++;
       if (i < total - 1) {
-        const w = await waitForTfNextQuestion(lastQinfo, 15000);
-        if (w.ok) {
+        const gridMode = gridNoChange >= 2;
+        const w = gridMode ? null : await waitForTfNextQuestion(lastQinfo, 15000);
+        if (w && w.ok) {
           lastQinfo = w.info;
-        } else if (w.unreadable) {
-          await sleep(getRandomHumanDelay(4200, 5200));
+          gridNoChange = 0;
+        } else if (w && w.unreadable) {
+          await sleep(getRandomHumanDelay(gridMode ? 2200 : 4200, gridMode ? 3200 : 5200));
           lastQinfo = await getCurrentTfQuestionInfo();
+          if (gridMode) gridNoChange = Math.min(gridNoChange + 1, 3);
         } else {
-          await sleep(getRandomHumanDelay(3500, 5000));
+          await sleep(getRandomHumanDelay(gridMode ? 2200 : 3500, gridMode ? 3200 : 5000));
           lastQinfo = await getCurrentTfQuestionInfo();
+          gridNoChange++;
         }
       }
     }
@@ -514,7 +836,45 @@
       return false;
     }, "🎯 Trắc nghiệm xong");
 
+    // BUG#29: game dạng "chọn hết rồi nộp" (nh-tim) — nộp cả bài nếu game chưa tự chấm
+    if (done > 0) await tryFinishGameSubmit("Trắc nghiệm");
     return done > 0;
+  }
+
+  // BUG#29 (live 17/09/2026, nh-tim — Vòng 2): một số game MCQ KHÔNG tự nộp
+  // sau khi chọn hết đáp án (giống chim-hai-tao: cần nút nộp cả bài). Sau khi
+  // click xong mà chưa thấy FINISHGAME → thử flow nộp: CONFIRM_ANSWER (nộp
+  // từng câu còn treo) → btnSubmit (nộp cả bài) → nameSubmit (đồng ý popup).
+  // Với game tự nộp rồi thì các bước này là no-op vô hại (không tìm thấy nút).
+  async function tryFinishGameSubmit(label) {
+    await sleep(4000); // đợi game tự nộp nếu nó có hành vi đó
+    if (lastFinishGameAt && Date.now() - lastFinishGameAt < 30000) return true; // đã nộp sẵn
+    let submitted = false;
+    // 1. nộp cả bài trực tiếp (chim-hai-tao flow)
+    const s1 = await ioeBridgeRequest("CLICK_NAME", { name: "btnSubmit" }, 8000);
+    if (s1 && s1.payload && s1.payload.ok) {
+      await sleep(1800);
+      const s2 = await ioeBridgeRequest("CLICK_NAME", { name: "nameSubmit" }, 8000);
+      submitted = !!(s2 && s2.payload && s2.payload.ok);
+      if (!submitted) submitted = true; // btnSubmit có thể tự nộp không cần popup
+    }
+    // 2. chưa thấy nút nộp cả bài → nộp từng câu còn treo (CONFIRM mỗi câu)
+    if (!lastFinishGameAt || Date.now() - lastFinishGameAt >= 30000) {
+      for (let k = 0; k < 3; k++) {
+        const c = await ioeBridgeRequest("CONFIRM_ANSWER", {}, 8000);
+        if (lastFinishGameAt && Date.now() - lastFinishGameAt < 5000) break;
+        await sleep(1500);
+      }
+    }
+    if (lastFinishGameAt && Date.now() - lastFinishGameAt < 30000) {
+      submitted = true;
+      showToast(`✅ ${label || "Bài"}: game đã chấm xong!`);
+    } else if (submitted) {
+      showToast(`📤 ${label || "Bài"}: đã bấm nộp — chờ game chấm...`);
+    } else {
+      showToast(`⚠️ ${label || "Bài"}: đã chọn đáp án nhưng không tìm thấy nút nộp — nếu game không tự chấm, hãy nộp tay.`);
+    }
+    return submitted;
   }
 
   // =============== TRANSFORM TYPING SOLVER (hanh-tinh-tim, Vòng 6 — 16/09/2026) ===============
@@ -584,12 +944,24 @@
         });
       }
 
-      // 4. Điền + bấm ANSWER
-      const fillResp = await ioeBridgeRequest("FILL_EDITBOXES", { texts: words }, 8000);
-      await sleep(getRandomHumanDelay(500, 900));
-      await ioeBridgeRequest("CLICK_ANSWER_BTN", {}, 8000);
+      // 4. Nộp: ĐƯỜNG CHUẨN = SUBMIT_TRANSFORM qua controller (BUG#30c: nút
+      //    ANSWER thật = ctrl.onKeyEnterPress, validation đòi từ dài ĐÚNG
+      //    maxLength từng ô — RPC tự đặt placeholder đúng độ dài cho từ sai).
+      //    Fallback đường cũ (FILL_EDITBOXES + CLICK_ANSWER_BTN) khi game
+      //    không có controller kiểu dienDoanVan.
+      let submittedOk = false;
+      const stResp = await ioeBridgeRequest("SUBMIT_TRANSFORM", { words }, 9000);
+      if (stResp && stResp.payload && stResp.payload.ok) {
+        submittedOk = true;
+        words = stResp.payload.submitted || words;
+      } else {
+        const fillResp = await ioeBridgeRequest("FILL_EDITBOXES", { texts: words }, 8000);
+        await sleep(getRandomHumanDelay(500, 900));
+        const ab = await ioeBridgeRequest("CLICK_ANSWER_BTN", {}, 8000);
+        submittedOk = !!(ab && ab.payload && ab.payload.ok);
+      }
       solved++;
-      showToast(`✍️ Câu ${solved}/${total}: ${words.join(" | ")}`);
+      showToast(`✍️ Câu ${solved}/${total}: ${words.join(" | ")}${submittedOk ? " + nộp" : " (chưa nộp được)"}`);
       await sleep(getRandomHumanDelay(3500, 5000));
     }
     return solved > 0;
@@ -727,7 +1099,7 @@
     const st = getGameBridgeStateDirect();
     if (!st || !st.questions || !st.questions.length) return false;
     const qs = st.questions;
-    const kind = classifyExam(qs);
+    let kind = classifyExam(qs, st);
     console.log("[English Master AI] 🎮 Phân loại đề từ dữ liệu API: " + kind);
 
     // START the game up-front for every solver path — the real games expire
@@ -736,12 +1108,59 @@
     await ioeBridgeRequest("START_GAME", {}, 6000);
     await sleep(2000);
 
+    // BUG#30b (nh-tim, 17/09/2026): format trong JSON API bị IOE trả LỘN TÙY LẦN
+    // (một lần 9/10 câu format 19, lần khác ít hơn) → classify theo format không
+    // ổn định. TÍN HIỆU BULLETPROOF: game đã START mà có EditBox nhập liệu trên
+    // màn → phải GÕ (transform), không thể là trắc nghiệm click. PHẢI chạy SAU
+    // START_GAME — EditBox chỉ tồn tại sau khi game vào màn chơi.
+    if (kind === "mcq_multi") {
+      try {
+        const rs = await ioeBridgeRequest("READ_GAME_SCREEN", {}, 8000);
+        const nEbx = (rs && rs.payload && Array.isArray(rs.payload.editboxes)) ? rs.payload.editboxes.length : 0;
+        if (nEbx > 0) {
+          kind = "transform_typing";
+          console.log("[English Master AI] 🛠️ Override: mcq_multi → transform_typing (màn hình có " + nEbx + " EditBox)");
+        }
+      } catch (e) {}
+    }
+
     // Matching (format 25, text pairs): exact API pairs, no AI
     if (kind === "matching") {
       const pairs = deriveMatchPairsFromGameApi();
       if (pairs.length) {
-        await ioeBridgeRequest("AUTO_MATCH", { pairs, runId: "match_" + Date.now() }, 30000 + pairs.length * 3000);
-        showToast(`✅ Cocos: đã tự ghép ${pairs.length} cặp!`);
+        // BUG#25: RPC AUTO_MATCH trả lời ngay (STARTED) — chờ event MATCH_DONE
+        // mang kết quả thật {done, failed} của runId này.
+        const runId = "match_" + Date.now();
+        lastMatchDoneInfo = null;
+        const waitMs = 30000 + pairs.length * 4500;
+        await ioeBridgeRequest("AUTO_MATCH", { pairs, runId }, waitMs);
+        const t0 = Date.now();
+        while (Date.now() - t0 < waitMs) {
+          if (lastMatchDoneInfo && lastMatchDoneInfo.runId === runId) break;
+          await sleep(500);
+        }
+        const md = (lastMatchDoneInfo && lastMatchDoneInfo.runId === runId) ? lastMatchDoneInfo : null;
+        const failedCount = md ? (md.failed || 0) : null;
+        // BUG#25 (live 17/09/2026): modal lỗi ("Mạng không ổn định") giữa chừng
+        // nuốt click → có cặp chưa match. Dismiss popup rồi chạy nốt 1 lượt nữa:
+        // cặp ĐÃ match thì node ẩn/đổi trạng thái → waitForNodeByText bỏ qua,
+        // cặp chưa match sẽ được click — an toàn không lặp.
+        if (failedCount > 0) {
+          await ioeBridgeRequest("DISMISS_POPUPS", {}, 8000);
+          await sleep(1200);
+          const retryRunId = "match_retry_" + Date.now();
+          lastMatchDoneInfo = null;
+          await ioeBridgeRequest("AUTO_MATCH", { pairs, runId: retryRunId }, waitMs);
+          const t1 = Date.now();
+          while (Date.now() - t1 < waitMs) {
+            if (lastMatchDoneInfo && lastMatchDoneInfo.runId === retryRunId) break;
+            await sleep(500);
+          }
+          const rd = (lastMatchDoneInfo && lastMatchDoneInfo.runId === retryRunId) ? lastMatchDoneInfo : null;
+          showToast(`🧩 Cocos: đã ghép ${pairs.length} cặp${rd && rd.failed ? ` (⚠️ ${rd.failed} cặp chưa ăn — bấm Giải lại F2)` : ""}!`);
+        } else {
+          showToast(`✅ Cocos: đã tự ghép ${pairs.length} cặp!`);
+        }
         return true;
       }
     }
@@ -763,11 +1182,15 @@
         } else {
           showToast(`✅ Cocos: đã tự chọn ${items.length} đáp án!`);
         }
+        // BUG#29: game dạng "chọn hết rồi nộp" — nộp cả bài nếu game chưa tự chấm
+        await tryFinishGameSubmit("Trắc nghiệm");
         return true;
       }
     }
 
     if (kind === "listening_fillword") return await solveAndTypeFillWords(qs, st);
+    if (kind === "word_order") return await solveWordOrder(qs, st);
+    if (kind === "reading_tf") return await solveReadingTfExam(qs, st);
     if (kind === "mcq_multi") return await solveAndClickMcqMulti(qs, st);
     if (kind === "transform_typing") return await solveTransformTyping(qs, st);
     if (kind === "cloze_chip") return await solveClozeChip(qs, st);
@@ -933,7 +1356,7 @@
     ioeRootEl.innerHTML = `
       <div class="ioe-control-pill" id="ioe-pill-toggle">
         <div class="ioe-badge-icon">IOE</div>
-        <span class="ioe-pill-title">English Master v3.5</span>
+        <span class="ioe-pill-title">English Master v3.6</span>
         <span id="ioe-audio-detected-badge" class="ioe-audio-pill hidden" title="Phát hiện bài thi nghe">🎧 Audio</span>
         <span id="ioe-game-api-badge" class="ioe-api-pill hidden" title="Đã đọc đề trực tiếp từ API game">🎮 API</span>
         <div class="ioe-pill-btn-group">
@@ -1183,6 +1606,30 @@
   //    Priority: Cocos API exact-data games (matching/MCQ) → AI solve (screenshots + audio,
   //    including multi-question True/False) → auto click/fill results.
   async function oneClickSolveAll() {
+    // BUG#28 (live 17/09/2026, ky-nang-noi — Vòng 1 bài tự chọn): bài thi NÓI
+    // cần giọng đọc THẬT vào micro để hệ thống chấm phát âm (Pronunciation/
+    // Intonation/Fluency) — AI không thể thay giọng người học, ghi âm giả bị
+    // server từ chối (live-verify: fake mic beep → 0 kết quả chấm). Từ chối
+    // lịch sự ngay thay vì gọi AI rồi click trượt 10 lần.
+    if (document.querySelector(".btn-micro-phone") || /ky-nang-noi|thi-noi|speaking-test/i.test(location.href)) {
+      createIOEUI();
+      panelEl.classList.remove("hidden");
+      const contentBox = document.getElementById("ioe-panel-content");
+      if (contentBox) {
+        contentBox.innerHTML = `
+          <div class="ioe-ans-banner">
+            <div class="ioe-ans-label"><span>🎤 BÀI THI NÓI — CHƯA HỖ TRỢ TỰ GIẢI</span></div>
+            <div style="margin-top:8px; font-size:12.5px; line-height:1.5;">
+              Bài thi nói cần bạn <b>đọc to từ/câu vào micro thật</b> để hệ thống chấm phát âm — bot không thể thay giọng của bạn.<br>
+              Cách làm: bấm nút 🎤 micro, đọc nội dung trên màn hình, bấm để dừng, xem phoneme, rồi bấm <b>Next</b>.<br>
+              <i>Các dạng khác (True/False, Ghép cặp, Trắc nghiệm, Điền từ, Sắp xếp từ, Đọc hiểu) vẫn tự giải bình thường.</i>
+            </div>
+          </div>
+        `;
+      }
+      showToast("🎤 Bài thi nói cần micro thật — hãy tự đọc to từ/câu. Xem hướng dẫn trong panel.");
+      return;
+    }
     // BUG#22: đang giải thì bấm "Tự Làm" thêm → bỏ qua (chống giải lồng nhau)
     if (!tryAcquireSolverBusy()) return;
     createIOEUI();
@@ -1793,7 +2240,12 @@
     // A. True / False
     if (lower === "true" || lower === "false" || lower.startsWith("true") || lower.startsWith("false")) {
       const isTrue = lower.startsWith("true");
-      const resp = await ioeBridgeRequest("CLICK_NAME", { name: isTrue ? "btnTrue" : "btnFalse" });
+      // BUG#24: thử theo nhãn TEXT trước — nhiều game TF nút KHÔNG tên btnTrue/
+      // btnFalse (live: bach-tuoc-thu-ngoc) nên CLICK_NAME luôn thất bại.
+      let resp = await ioeBridgeRequest("CLICK_TEXT", { text: isTrue ? "True" : "False" }, 8000);
+      if (!(resp && resp.payload && resp.payload.ok)) {
+        resp = await ioeBridgeRequest("CLICK_NAME", { name: isTrue ? "btnTrue" : "btnFalse" }, 8000);
+      }
       if (resp && resp.payload && resp.payload.ok) {
         showToast(`✅ Cocos: đã chọn [${isTrue ? "True" : "False"}]!`);
         return true;
@@ -1847,7 +2299,8 @@
   async function waitForTfNextQuestion(prevInfo, timeoutMs = 12000) {
     const prevQnum = prevInfo ? prevInfo.qnum : null;
     const prevText = (prevInfo && prevInfo.text) || "";
-    const canDetect = (prevQnum !== null && prevQnum !== undefined) || !!prevText;
+    const prevSig = (prevInfo && prevInfo.sig) || "";
+    const canDetect = (prevQnum !== null && prevQnum !== undefined) || !!prevText || !!prevSig;
     if (!canDetect) {
       return { ok: false, unreadable: true, info: prevInfo };
     }
@@ -1863,8 +2316,11 @@
       const animDone = Date.now() - start >= MIN_ANIM_MS;
       const qnumAdvanced = animDone && info.qnum !== null && prevQnum !== null && info.qnum > prevQnum;
       const textChanged = animDone && info.text && prevText && info.text !== prevText;
+      // BUG#26: sig = join RICHTEXT_CHILD (statement+passage) — đổi khi statement
+      // đổi dù passage giữ nguyên → bắt được chuyển câu ở game không có counter.
+      const sigChanged = animDone && info.sig && prevSig && info.sig !== prevSig;
 
-      if (qnumAdvanced || textChanged) {
+      if (qnumAdvanced || textChanged || sigChanged) {
         // Label is on screen, but the card/animation may still be settling —
         // give it a full beat so the answer button is completely interactive.
         await sleep(1000);
@@ -1901,10 +2357,26 @@
         await sleep(300);
       }
       if (!lastQinfo.text && lastQinfo.qnum === null) {
-        // Couldn't read the screen — fall back to a generous fixed wait so we
-        // still don't click during the intro animation.
-        await sleep(4200);
-        lastQinfo = await getCurrentTfQuestionInfo();
+        // BUG#27 (live 17/09/2026, ang-noi): màn hình KHÔNG đọc được câu 1 sau
+        // 10s ≈ game vẫn kẹt ở màn hướng dẫn/popup "Checking device" (start
+        // chưa ăn). Retry START_GAME (dismiss popup + bấm start) tối đa 2 lần
+        // — KHÔNG click mù 10 đáp án vào game chưa start (đã sống sót: 10
+        // click trượt, 0 ANSWERCHECK, game chết đứng 22 phút).
+        let rescued = false;
+        for (let attempt = 0; attempt < 2 && !rescued; attempt++) {
+          await ioeBridgeRequest("START_GAME", {}, 10000);
+          await sleep(3000);
+          const info2 = await getCurrentTfQuestionInfo();
+          if ((info2.qnum !== null && info2.qnum >= 1) || (info2.text && info2.text.length >= 15)) {
+            lastQinfo = info2;
+            rescued = true;
+          }
+        }
+        if (!rescued) {
+          showToast("⚠️ Game chưa start được (màn hướng dẫn/popup đang chặn) — bấm OK/Start trên game rồi bấm Tự Làm lại.");
+          return false;
+        }
+        await sleep(1000); // settle beat sau khi game vừa start
       } else {
         await sleep(1000); // settle beat after the question is visible
       }
@@ -1924,9 +2396,15 @@
       // chosen the game always animates to the next question, and we block until
       // that animation completes. The pre-click state was captured in lastQinfo.)
 
-      const nodeName = val ? "btnTrue" : "btnFalse";
-      const resp = await ioeBridgeRequest("CLICK_NAME", { name: nodeName }, 8000);
-      const ok = !!(resp && resp.payload && resp.payload.ok);
+      // BUG#24 (live 17/09/2026, bach-tuoc-thu-ngoc TF): nút True/False KHÔNG
+      // tên btnTrue/btnFalse và nằm ở góc dưới phải (~75-82% chiều cao) —
+      // toạ độ % cũ (17.5%/28.9%) trật hoàn toàn. Thử theo NHÃN TEXT trước.
+      let resp = await ioeBridgeRequest("CLICK_TEXT", { text: val ? "True" : "False" }, 8000);
+      let ok = !!(resp && resp.payload && resp.payload.ok);
+      if (!ok) {
+        resp = await ioeBridgeRequest("CLICK_NAME", { name: val ? "btnTrue" : "btnFalse" }, 8000);
+        ok = !!(resp && resp.payload && resp.payload.ok);
+      }
       if (ok) {
         clicked++;
         showToast(`✅ Câu ${i + 1}/${lastTrueFalseAnswers.length}: đã chọn [${val ? "True" : "False"}]`);
@@ -1948,7 +2426,15 @@
       // during that animation selects the next card blindly → wrong answers. So after
       // every click we block until the on-screen question has actually changed.
       if (i < lastTrueFalseAnswers.length - 1) {
-        const w = await waitForTfNextQuestion(lastQinfo);
+        let w = await waitForTfNextQuestion(lastQinfo, 8000);
+        if (!w.ok) {
+          // BUG#24b+26 (live 17/09/2026): chưa chuyển câu → nộp đáp án (nút
+          // ANSWER/Submit riêng) rồi chờ lại — áp dụng CẢ case unreadable
+          // (game chim-hai-tao: chọn xong KHÔNG tự chuyển câu, phải bấm nộp).
+          if (w.unreadable) await sleep(getRandomHumanDelay(2500, 3500));
+          await ioeBridgeRequest("CONFIRM_ANSWER", {}, 8000);
+          w = await waitForTfNextQuestion(lastQinfo, 12000);
+        }
         if (w.ok) {
           lastQinfo = w.info;
         } else if (w.unreadable) {
@@ -2615,7 +3101,7 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
 
     // Detect multi-question True/False listening exam via game API (each question has its own audio file)
     const apiQuestions = getGameQuestions() || [];
-    const examClass = classifyExam(apiQuestions);
+    const examClass = classifyExam(apiQuestions, getGameBridgeStateDirect());
     // Masked listening exams (fill-word) are NOT True/False — exclude them here so
     // they take the dedicated fill-word path instead of the TF pipeline (BUG#1).
     const isMultiTfExam = apiQuestions.length > 1 &&
@@ -2625,11 +3111,13 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
     // Data-driven dispatch: when we already hold the exact API JSON for a
     // fill-word / multi-MCQ exam, solve it straight from the data (AI + typing /
     // option clicking) — regardless of which button (F2 / Tự Làm) fired this.
-    if (!useOverride && (examClass === "listening_fillword" || examClass === "mcq_multi")) {
+    if (!useOverride && (examClass === "listening_fillword" || examClass === "mcq_multi" || examClass === "word_order")) {
       const stE = getGameBridgeStateDirect();
       const done = examClass === "listening_fillword"
         ? await solveAndTypeFillWords(apiQuestions, stE)
-        : await solveAndClickMcqMulti(apiQuestions, stE);
+        : (examClass === "word_order"
+            ? await solveWordOrder(apiQuestions, stE)
+            : await solveAndClickMcqMulti(apiQuestions, stE));
       // BUG#22: isSolving chỉ reset SAU khi phase gõ/click thật sự xong (bản cũ
       // reset TRƯỚC → suốt vài phút gõ từ, isSolving=false → bấm thêm là lồng).
       isSolving = false;
