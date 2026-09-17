@@ -1,5 +1,5 @@
 /**
- * English Master AI - Dedicated IOE Universal Game Solver v3.4
+ * English Master AI - Dedicated IOE Universal Game Solver v3.5
  * Supports: True/False Listening (Dọn rác bãi biển), Matching Pairs (Ghép Cặp 12 ô), MCQ (Tái tạo san hô, Fansipan, Leo núi), Long Reading Passage Auto-Scroll & Extraction
  */
 
@@ -7,7 +7,7 @@
   if (window.__IOE_MASTER_LOADED__) return;
   window.__IOE_MASTER_LOADED__ = true;
 
-  console.log("%c[English Master AI v3.4] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
+  console.log("%c[English Master AI v3.5] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
 
   // 1. Super Unblocker
   function superUnblockAll() {
@@ -797,9 +797,10 @@
     // Listening True/False: API has no answers — solve ALL questions with AI
     // (multi-audio exam) then auto-click each result. No manual F2 needed.
     showToast("🎧 Bài nghe True/False: đang nhờ AI nghe & giải toàn bộ câu hỏi...");
-    await executeScreenAndAudioSolve("", async (success, answer, hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf) => {
+    await executeScreenAndAudioSolve("", async (success, answer, hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf, busySkipped) => {
       if (!success) {
-        showToast("⚠️ AI không giải được bài nghe. Hãy thử lại.");
+        // BUG#22: busySkipped = bị bỏ qua vì đang bận (đã có toast riêng)
+        if (!busySkipped) showToast("⚠️ AI không giải được bài nghe. Hãy thử lại.");
         return;
       }
       if (lastTrueFalseAnswers.length > 0) {
@@ -845,6 +846,74 @@
   let autoTimer = null;
   let autoCountdownInterval = null;
 
+  // ===== BUG#22 (v3.5): KHÓA CHỐNG GIẢI LỒNG NHAU (re-entry guard) =====
+  // Khi AI giải lâu, người dùng bấm "Tự Làm"/F2 thêm nhiều lần → nhiều luồng giải
+  // chạy song song, chồng chéo click/gõ/ghép thẻ gây lỗi (gõ từ lặp 2 lần, click
+  // sai thứ tự câu, game nhảy loạn). Từ giờ: đang giải thì MỌI trigger (Tự Làm /
+  // F2 / Ctrl+Space / F4 / Giải lại / Enter hint / Áp dụng đoạn đọc) đều bị bỏ
+  // qua + hiện thông báo; khóa chỉ nhả khi TOÀN BỘ quy trình (AI + tự click/gõ)
+  // thật sự kết thúc. Khóa riêng biệt với isSolving (cờ nội bộ của 1 lần gọi AI)
+  // vì isSolving bị reset SỚM hơn điểm kết thúc thật (trước đây: reset trước cả
+  // khi phase gõ/click chạy xong → lỗ hổng giải lồng nhau).
+  let isSolverBusy = false;
+  let solverBusyGen = 0;
+  let lastBusyToastTs = 0;
+
+  function setSolveControlsDisabled(disabled) {
+    if (ioeRootEl) {
+      // Nút Tự Làm khi auto-pilot (F4) đang chạy đóng vai nút "Dừng" — không disable
+      const pairs = [
+        [ioeRootEl.querySelector("#ioe-auto-btn"), !isAutoRunning],
+        [ioeRootEl.querySelector("#ioe-trigger-solve-btn"), true],
+        [ioeRootEl.querySelector("#ioe-re-solve-hint-btn"), true]
+      ];
+      pairs.forEach(([btn, apply]) => {
+        if (btn && apply) {
+          btn.disabled = disabled;
+          btn.style.opacity = disabled ? "0.55" : "1";
+          btn.style.cursor = disabled ? "not-allowed" : "";
+        }
+      });
+    }
+    // Thuộc tính DOM để debug/E2E test quan sát trạng thái khóa từ MAIN world
+    try {
+      document.documentElement.setAttribute("data-ema-busy", disabled ? "1" : "0");
+    } catch (e) {}
+  }
+
+  function tryAcquireSolverBusy() {
+    if (isSolverBusy) {
+      // Auto-pilot (F4) tự loop nội bộ — lượt kế rơi vào lúc chưa nhả khóa là
+      // bình thường, không toast mỗi vòng (nó tự retry qua busySkipped).
+      if (!isAutoRunning) {
+        const now = Date.now();
+        // Throttle 2.5s: bấm liên tiếp chỉ hiện 1 toast, không spam màn hình
+        if (now - lastBusyToastTs > 2500) {
+          lastBusyToastTs = now;
+          showToast("⏳ Bot đang giải bài... Vui lòng đợi đến khi xong rồi bấm tiếp (bấm thêm đang bị bỏ qua để tránh giải lồng nhau gây lỗi).");
+        }
+      }
+      return false;
+    }
+    isSolverBusy = true;
+    setSolveControlsDisabled(true);
+    // Watchdot 5 phút: nếu 1 code path nào đó quên nhả khóa (throw giữa chừng,
+    // callback lỗi...) thì tự nhả để không kẹt vĩnh viễn đến khi F5.
+    const gen = ++solverBusyGen;
+    setTimeout(() => {
+      if (isSolverBusy && solverBusyGen === gen) {
+        console.warn("[English Master AI] BUG#22 watchdog: khóa giải không được nhả đúng — tự nhả sau 5 phút.");
+        releaseSolverBusy();
+      }
+    }, 5 * 60 * 1000);
+    return true;
+  }
+
+  function releaseSolverBusy() {
+    isSolverBusy = false;
+    setSolveControlsDisabled(false);
+  }
+
   function getRandomHumanDelay(minMs, maxMs) {
     const base = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
     const jitter = Math.floor((Math.random() - 0.5) * 500);
@@ -864,7 +933,7 @@
     ioeRootEl.innerHTML = `
       <div class="ioe-control-pill" id="ioe-pill-toggle">
         <div class="ioe-badge-icon">IOE</div>
-        <span class="ioe-pill-title">English Master v3.4</span>
+        <span class="ioe-pill-title">English Master v3.5</span>
         <span id="ioe-audio-detected-badge" class="ioe-audio-pill hidden" title="Phát hiện bài thi nghe">🎧 Audio</span>
         <span id="ioe-game-api-badge" class="ioe-api-pill hidden" title="Đã đọc đề trực tiếp từ API game">🎮 API</span>
         <div class="ioe-pill-btn-group">
@@ -1007,6 +1076,12 @@
     // Shared post-solve auto-click: after ANY solve path (F2 / Giải lại / hint),
     // automatically apply the answer — one-button philosophy.
     const solveAndAutoClick = function (hint) {
+      // BUG#22: F4 auto-pilot đang tự chạy thì F2/Giải lại/Enter bị bỏ qua
+      // (2 luồng cùng click/gõ sẽ lồng nhau); bấm F4 hoặc nút Tự Làm để DỪNG trước.
+      if (isAutoRunning) {
+        showToast("🤖 Tự Làm liên tục (F4) đang chạy — bấm F4 hoặc nút Tự Làm để DỪNG trước khi giải thủ công.");
+        return;
+      }
       executeScreenAndAudioSolve(hint, async (success) => {
         if (!success) return;
         if (lastMatchingPairs && lastMatchingPairs.length > 0) {
@@ -1108,14 +1183,10 @@
   //    Priority: Cocos API exact-data games (matching/MCQ) → AI solve (screenshots + audio,
   //    including multi-question True/False) → auto click/fill results.
   async function oneClickSolveAll() {
+    // BUG#22: đang giải thì bấm "Tự Làm" thêm → bỏ qua (chống giải lồng nhau)
+    if (!tryAcquireSolverBusy()) return;
     createIOEUI();
     panelEl.classList.remove("hidden");
-
-    const btn = ioeRootEl?.querySelector("#ioe-auto-btn");
-    if (btn) {
-      btn.disabled = true;
-      btn.style.opacity = "0.7";
-    }
 
     try {
       // A. Cocos game with exact API data: classify from the DATA (not URL) and
@@ -1129,18 +1200,25 @@
         }
         if (st && st.questions && st.questions.length) {
           const handled = await solveCocosGameWithApi();
-          if (handled) return;
+          if (handled) return; // return vẫn đi qua finally → nhả khóa
         }
       }
+    } finally {
+      // BUG#22: nhả khóa trước khi vào AI path — executeScreenAndAudioSolve sẽ
+      // giành lại khóa NGAY ở dòng đầu tiên (đồng bộ → không có khoảng trống
+      // cho click khác xen vào giữa 2 lệnh này).
+      releaseSolverBusy();
+    }
 
       // B. AI solve: screenshots + extracted text + audio (single or multi-question T/F)
       //    then auto-click/fill the results — no manual F2 needed.
     // Auto-click after solve is normally reserved for the one-click "Tự Làm" flow.
     // Pass opt.noAutoClick=true for the plain F2/Chụp & Giải path when the user
     // wants to review the answer first.
-    await executeScreenAndAudioSolve("", async (success, answer, hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf) => {
+    await executeScreenAndAudioSolve("", async (success, answer, hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf, busySkipped) => {
       if (!success) {
-        showToast("⚠️ AI không giải được. Hãy thử lại.");
+        // BUG#22: bị bỏ qua vì lượt khác đang chạy — toast hướng dẫn đã hiện sẵn
+        if (!busySkipped) showToast("⚠️ AI không giải được. Hãy thử lại.");
         return;
       }
 
@@ -1175,16 +1253,13 @@
 
         showToast("⚠️ Không có đáp án để tự điền. Hãy kiểm tra kết quả AI trong bảng.");
       });
-    } finally {
-      const btn2 = ioeRootEl?.querySelector("#ioe-auto-btn");
-      if (btn2) {
-        btn2.disabled = false;
-        btn2.style.opacity = "1";
-      }
-    }
+    // BUG#22: khóa bận của AI path do executeScreenAndAudioSolve tự quản
+    // (giành khi vào, nhả khi callback tự click/gõ chạy xong).
   }
 
   window.oneClickSolveAllIOE = oneClickSolveAll;
+  // Trạng thái khóa để debug + E2E test (read-only)
+  window.__IOE_SOLVER_STATE__ = () => ({ isSolverBusy, isAutoRunning, isSolving });
 
   // 4. AUTO-PILOT ENGINE WITH GAME-AWARE ANIMATION TIMING
   function toggleAutoPilot() {
@@ -1196,6 +1271,16 @@
   }
 
   function startAutoPilot() {
+    // BUG#22: một lượt giải thủ công đang chạy thì chưa cho bật auto-pilot —
+    // chờ xong rồi bấm F4 lại (tránh 2 luồng giải lồng nhau).
+    if (isSolverBusy) {
+      const now = Date.now();
+      if (now - lastBusyToastTs > 2500) {
+        lastBusyToastTs = now;
+        showToast("⏳ Bot đang giải bài... Đợi lượt này xong rồi mới bấm F4.");
+      }
+      return;
+    }
     createIOEUI();
     panelEl.classList.remove("hidden");
     isAutoRunning = true;
@@ -1345,8 +1430,16 @@
     // Record baseline snapshot before solving
     const previousSnapshot = getCurrentQuestionSnapshot();
 
-    executeScreenAndAudioSolve("", async (success, answer, hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf) => {
+    executeScreenAndAudioSolve("", async (success, answer, hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf, busySkipped) => {
       if (!isAutoRunning) return;
+
+      // BUG#22: bị chặn vì lượt trước chưa nhả khóa xong (khóa nhả sau khi
+      // callback này kết thúc) — retry im lặng sau 1.5s, KHÔNG báo lỗi.
+      if (busySkipped) {
+        await sleep(1500);
+        if (isAutoRunning) runAutoPilotStep();
+        return;
+      }
 
       if (!success) {
         showToast("⚠️ Không giải được câu này, thử lại sau 2s...");
@@ -2459,7 +2552,30 @@
 
   // 7. EXECUTE SOLVER
 async function executeScreenAndAudioSolve(customHint = "", callback = null, options = {}) {
-    if (isSolving) return;
+    if (isSolving) {
+      // BUG#22: trả callback(false, busySkipped=true) để caller phân biệt "bị
+      // bỏ qua vì đang bận" với "AI giải thất bại" (auto-pilot cần điều này
+      // để retry im lặng thay vì báo lỗi).
+      if (callback) callback(false, null, false, false, false, false, false, true);
+      return;
+    }
+    // BUG#22: giành khóa toàn cục chống giải lồng nhau — mọi trigger đều đi qua
+    // đây nên đang giải thì lần gọi mới bị bỏ qua + hiện toast hướng dẫn.
+    if (!tryAcquireSolverBusy()) {
+      if (callback) callback(false, null, false, false, false, false, false, true);
+      return;
+    }
+    // Wrap callback: khóa chỉ được nhả khi TOÀN BỘ hậu kỳ của caller (tự click
+    // ghép cặp / click True-False / gõ từ / điền đáp án) chạy xong — không phải
+    // khi AI vừa trả lời như bản cũ (isSolving=false đặt tại đầu handler
+    // sendMessage trong khi callback click/gõ vẫn đang chạy → bấm thêm là lồng).
+    const releaseLock = () => releaseSolverBusy();
+    const cb = callback
+      ? (...args) => Promise.resolve()
+          .then(() => callback(...args))
+          .catch((e) => console.warn("[English Master AI] Solver callback error:", e))
+          .finally(releaseLock)
+      : null;
     createIOEUI();
     panelEl.classList.remove("hidden");
 
@@ -2510,16 +2626,18 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
     // fill-word / multi-MCQ exam, solve it straight from the data (AI + typing /
     // option clicking) — regardless of which button (F2 / Tự Làm) fired this.
     if (!useOverride && (examClass === "listening_fillword" || examClass === "mcq_multi")) {
-      isSolving = false;
       const stE = getGameBridgeStateDirect();
       const done = examClass === "listening_fillword"
         ? await solveAndTypeFillWords(apiQuestions, stE)
         : await solveAndClickMcqMulti(apiQuestions, stE);
+      // BUG#22: isSolving chỉ reset SAU khi phase gõ/click thật sự xong (bản cũ
+      // reset TRƯỚC → suốt vài phút gõ từ, isSolving=false → bấm thêm là lồng).
+      isSolving = false;
       if (isAutoRunning && done) {
         showToast("✅ Bot đã làm xong toàn bộ bài này.");
         stopAutoPilot();
       }
-      if (callback) callback(!!done, null, false, false, false, false, false);
+      if (cb) cb(!!done, null, false, false, false, false, false); else releaseLock();
       return;
     }
 
@@ -2602,7 +2720,7 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
       isSolving = false;
       if (!resp) {
         contentBox.innerHTML = '<div style="color: red; padding: 10px;">Không thể kết nối đến extension.</div>';
-        if (callback) callback(false, null, false, false, false);
+        if (cb) cb(false, null, false, false, false, false, false); else releaseLock();
         return;
       }
 
@@ -2824,14 +2942,14 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
           navigator.clipboard.writeText(lastAnswerParsed);
         }
 
-        if (callback) callback(true, lastAnswerParsed, resp.hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf);
+        if (cb) cb(true, lastAnswerParsed, resp.hasAudio, isMatching, isTrueFalse, isMcq, isMultiTf); else releaseLock();
       } else {
         contentBox.innerHTML = `
           <div style="color: #b91c1c; background: #fef2f2; padding: 12px; border-radius: 8px; line-height: 1.5;">
             <strong>⚠️ Lỗi:</strong> ${escapeHtml(resp.error)}
           </div>
         `;
-        if (callback) callback(false, null, false, false, false, false);
+        if (cb) cb(false, null, false, false, false, false, false); else releaseLock();
       }
     });
   }

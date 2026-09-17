@@ -1,5 +1,5 @@
 /**
- * English Master AI - Background Service Worker v3.4
+ * English Master AI - Background Service Worker v3.5
  * Universal Game Type Classifier: True/False Listening • Matching Pairs • MCQ • Fill Blanks
  */
 
