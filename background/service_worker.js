@@ -1,5 +1,5 @@
 /**
- * English Master AI - Background Service Worker v3.3
+ * English Master AI - Background Service Worker v3.4
  * Universal Game Type Classifier: True/False Listening • Matching Pairs • MCQ • Fill Blanks
  */
 
@@ -303,6 +303,21 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
       // "API_KEY_INVALID" mà thông điệp thật của Google là "API key not valid.
       // Please pass a valid API key." → không bao giờ khớp.
       const emsg = String(err && err.message || "");
+      // BUG#21 (v3.4): Google SUSPEND cả project đứng sau key — 2 signature THẬT
+      // bắt được 17/09/2026:
+      // (a) 403 PERMISSION_DENIED "Consumer 'api_key:AQ.xxx' has been suspended."
+      //     (reason CONSUMER_SUSPENDED) — key ĐÚNG format nhưng project bị đình chỉ.
+      // (b) 401 UNAUTHENTICATED "The bound service account is deleted or disabled.
+      //     The service account bound to the API key must be active."
+      //     (reason ACCOUNT_STATE_INVALID) — service account của project bị xóa/tắt.
+      // Cả 2 KHÔNG phải do user gõ sai key: mọi key sinh từ cùng project đều chết
+      // (kể cả key vừa tạo mới). Signature (a) chứa "api_key:" nên nếu để SAU sẽ
+      // rơi vào nhánh generic "API Key KHÔNG HỢP LỆ" ở dưới → user không biết đường
+      // xử lý đúng là tạo key ở PROJECT MỚI.
+      if ((err.status === 401 || err.status === 403) &&
+          /has been suspended|CONSUMER_SUSPENDED|service account is deleted or disabled|ACCOUNT_STATE_INVALID/i.test(emsg)) {
+        throw new Error("Google đã ĐÌNH CHỈ (suspend) toàn bộ Google Cloud project của API Key này. Key bạn nhập vẫn ĐÚNG nhưng không dùng được — mọi key tạo thêm từ project cũ này cũng bị chặn y hệt. Cách xử lý: mở aistudio.google.com/app/apikey → bấm 'Create API key' → chọn 'Create API key in NEW project' (nhất thiết PROJECT MỚI) → copy key mới → dán vào extension → bấm Lưu & Kiểm tra. Xem email Google Cloud để biết lý do suspend và kháng nghị tại console.cloud.google.com nếu cần. Chi tiết Google: " + emsg);
+      }
       // BUG#16: Google từ chối key (400/401/403 "API key not valid..." / "API_KEY_INVALID")
       // → DỪNG NGAY chuỗi fallback: cùng 1 key, mọi model cũng fail y hệt (mất 10-20s
       // vô ích) và lỗi bị gán nhãn sai thành "model quá tải". Bản cũ chỉ khớp chuỗi
