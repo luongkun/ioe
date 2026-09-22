@@ -132,6 +132,25 @@
   display: flex;
   flex-direction: column;
   z-index: 2147483647;
+  /* BUG#35 (live 22/09/2026, ghep-cap — "Bài thi số 3"): bảng điều khiển nằm
+     ĐÈ LÊN lưới thẻ của game. Click "trusted" qua CDP được hit-test như chuột
+     thật, nên thẻ nào nằm dưới bảng thì click bị NUỐT vào bảng — bot ghép cặp
+     đứng ở 4/6 cặp (2 thẻ hàng trên-cùng bên trái y=399 nằm dưới footer, xem
+     elementFromPoint → "ioe-panel-footer"), 0 lượt sai, không có lỗi nào.
+     Cho cả bảng pointer-events:none rồi BẬT LẠI ở đúng các phần tử tương tác:
+     phần nền/khung trong suốt với chuột → click xuyên xuống canvas. */
+  pointer-events: none;
+}
+
+/* Bật lại tương tác cho các thành phần thật sự cần chuột. */
+.ioe-panel-header,
+.ioe-panel button,
+.ioe-panel input,
+.ioe-panel textarea,
+.ioe-panel select,
+.ioe-panel a,
+.ioe-panel [class*="ioe-btn"] {
+  pointer-events: auto;
 }
 
 .ioe-panel.hidden {

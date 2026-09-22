@@ -64,6 +64,14 @@
       // BUG#25: AUTO_MATCH RPC trả lời ngay STARTED — kết quả thật (done/failed)
       // đến qua event này. Lưu lại để solver biết có cặp chưa ăn để retry.
       lastMatchDoneInfo = d.payload || null;
+    } else if (d.type === "MATCH_PROGRESS") {
+      // BUG#33b (live 22/09/2026): MATCH_PROGRESS trước đây KHÔNG được xử lý ở
+      // đâu cả → khi autoMatch đứng ở giữa ván (4/6 cặp) không có cách nào biết
+      // nó kẹt ở cặp nào. Ghi log để chẩn đoán tại chỗ.
+      const p = d.payload || {};
+      console.log("[English Master AI] 🧩 ghép cặp " + ((p.index || 0) + 1) + "/" + p.total +
+        (p.already ? " (đã ghép, bỏ qua)" : p.reason ? " ⚠️ " + p.reason : " matched=" + p.matched) +
+        (p.wrongPick ? " wrongPick=" + p.wrongPick : ""));
     } else if (d.__ioeTrustedClick) {
       // BUG#31: bridge (MAIN world) xin CLICK TRUSTED qua chrome.debugger —
       // game engine cũ (Cocos 2.0.0 alpha) bỏ qua synthetic DOM events.
@@ -126,17 +134,29 @@
     return typeof s === "string" && /\.(png|jpe?g|gif|webp|bmp)(\?|$)/i.test(s);
   }
 
-  // Build [ [prompt, answer], ... ] pairs from the exact game JSON (text-only pairs)
-  function deriveMatchPairsFromGameApi() {
+  // Build [ [prompt, answer], ... ] pairs from the exact game JSON.
+  //
+  // BUG#34 (live 22/09/2026, ghep-cap — "Bài thi số 3", Vòng 3 lớp 11):
+  // Vòng này ghép CHỮ ↔ ẢNH, không phải chữ ↔ chữ:
+  //     detective            → …/detective.jpg
+  //     /ˈɜː.bən ˈsen.tər/   → …/tl-v3-1.jpg
+  // Bản cũ BỎ mọi cặp có ảnh (isImageRef) ⇒ trả 0 cặp ⇒ classifyExam không thấy
+  // "matching" ⇒ rơi xuống nhánh AI chụp màn hình ⇒ 10/60. Giờ giữ cả cặp ảnh;
+  // phía bridge nhận diện thẻ ảnh qua `dataAnswer` (thẻ ảnh KHÔNG có Label, xem
+  // cardKeys trong game-api-bridge.js).
+  function deriveMatchPairsFromGameApi(opts) {
+    const includeImages = !!(opts && opts.includeImages);
     const qs = getGameQuestions();
     if (!qs || !qs.length) return [];
     const pairs = [];
     for (const q of qs) {
-      const prompt = (q.prompt || "").trim();
+      const prompt = String(q.prompt || "").trim();
       const ans = (q.tans && q.tans.length) ? String(q.tans[0]).trim() : ((q.answers && q.answers.length) ? String(q.answers[0]).trim() : "");
       if (!prompt || !ans) continue;
-      if (isImageRef(prompt) || isImageRef(ans)) continue;
-      if (/^https?:\/\//i.test(prompt) || /^https?:\/\//i.test(ans)) continue;
+      if (!includeImages) {
+        if (isImageRef(prompt) || isImageRef(ans)) continue;
+        if (/^https?:\/\//i.test(prompt) || /^https?:\/\//i.test(ans)) continue;
+      }
       pairs.push([prompt, ans]);
     }
     return pairs;
@@ -153,7 +173,9 @@
     const allMasked = qs.every(q => q.masked);
     const withTans = qs.filter(q => q.tans && q.tans.length);
     const withOptions = qs.filter(q => q.answers && q.answers.length >= 2);
-    const textPairs = deriveMatchPairsFromGameApi();
+    // BUG#34: gọi kèm includeImages — nếu không, vòng ghép CHỮ↔ẢNH (mọi cặp đều
+    // có URL ảnh) bị lọc sạch → không bao giờ nhận ra "matching".
+    const textPairs = deriveMatchPairsFromGameApi({ includeImages: true });
 
     // ===== Dạng mới (live 17/09/2026, bach-tuoc-thu-ngoc — Vòng 1): SẮP XẾP TỪ =====
     // gameDesc hướng dẫn "đặt từ đúng thứ tự" + mọi câu có answers là các mảnh
@@ -1141,9 +1163,9 @@
       } catch (e) {}
     }
 
-    // Matching (format 25, text pairs): exact API pairs, no AI
+    // Matching (format 25): exact API pairs (text↔text hoặc text↔image), no AI
     if (kind === "matching") {
-      const pairs = deriveMatchPairsFromGameApi();
+      const pairs = deriveMatchPairsFromGameApi({ includeImages: true });
       if (pairs.length) {
         // BUG#25: RPC AUTO_MATCH trả lời ngay (STARTED) — chờ event MATCH_DONE
         // mang kết quả thật {done, failed} của runId này.
@@ -1158,11 +1180,23 @@
         }
         const md = (lastMatchDoneInfo && lastMatchDoneInfo.runId === runId) ? lastMatchDoneInfo : null;
         const failedCount = md ? (md.failed || 0) : null;
+        const skippedCount = md ? (md.skipped || 0) : 0;
+        // BUG#33: autoMatch dừng sớm khi sắp chạm ngân sách sai (sai 4 lần là
+        // game tự kết thúc ván) → retry sẽ vô ích, chỉ tốn thêm lượt sai.
+        if (skippedCount > 0) {
+          showToast(`🧩 Cocos: ghép được ${(md.done || 0)}/${pairs.length} cặp — dừng để không bị kết thúc ván.`);
+          return true;
+        }
+        // BUG#33b (live 22/09/2026): `md === null` nghĩa là autoMatch KHÔNG gửi
+        // MATCH_DONE (ném lỗi giữa vòng, hoặc hết waitMs). Bản cũ chỉ retry khi
+        // `failedCount > 0` — mà null > 0 là false ⇒ mất luôn lượt chạy lại và
+        // kẹt ở giữa ván (live: dừng ở 4/6 cặp, không có cặp nào sai). Coi
+        // "không rõ kết quả" là CÓ cặp chưa ăn để chạy nốt.
         // BUG#25 (live 17/09/2026): modal lỗi ("Mạng không ổn định") giữa chừng
         // nuốt click → có cặp chưa match. Dismiss popup rồi chạy nốt 1 lượt nữa:
         // cặp ĐÃ match thì node ẩn/đổi trạng thái → waitForNodeByText bỏ qua,
         // cặp chưa match sẽ được click — an toàn không lặp.
-        if (failedCount > 0) {
+        if (failedCount === null || failedCount > 0) {
           await ioeBridgeRequest("DISMISS_POPUPS", {}, 8000);
           await sleep(1200);
           const retryRunId = "match_retry_" + Date.now();
@@ -1174,7 +1208,12 @@
             await sleep(500);
           }
           const rd = (lastMatchDoneInfo && lastMatchDoneInfo.runId === retryRunId) ? lastMatchDoneInfo : null;
-          showToast(`🧩 Cocos: đã ghép ${pairs.length} cặp${rd && rd.failed ? ` (⚠️ ${rd.failed} cặp chưa ăn — bấm Giải lại F2)` : ""}!`);
+          if (rd && rd.done >= pairs.length) {
+            showToast(`✅ Cocos: đã tự ghép ${pairs.length} cặp!`);
+          } else {
+            const got = rd ? (rd.done || 0) : 0;
+            showToast(`🧩 Cocos: ghép được ${got}/${pairs.length} cặp — bấm Giải lại (F2) để làm nốt.`);
+          }
         } else {
           showToast(`✅ Cocos: đã tự ghép ${pairs.length} cặp!`);
         }
@@ -2008,7 +2047,7 @@
   // 5. MATCHING PAIRS AUTO-CLICKER (3x4 Grid on Canvas & DOM)
   async function executeMatchingClicksSequentially() {
     // Preferred path: Cocos Creator game — use exact API pairs and click real nodes
-    const cocosPairs = deriveMatchPairsFromGameApi();
+    const cocosPairs = deriveMatchPairsFromGameApi({ includeImages: true });
     if (isCocosGame() && cocosPairs.length > 0) {
       showToast(`🧩 Cocos: tự ghép ${cocosPairs.length} cặp từ API game...`);
       const started = await ioeBridgeRequest("START_GAME", {});
@@ -3081,6 +3120,33 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
       : null;
     createIOEUI();
     panelEl.classList.remove("hidden");
+
+    // BUG#34 (live 22/09/2026): nhánh dữ liệu chính xác (Cocos API) CHỈ có trong
+    // đường F4 (autoSolveCocosGame). F2 / "Chụp & Giải" / "Giải lại" rơi thẳng
+    // xuống AI chụp màn hình — nên vòng ghép cặp chữ↔ảnh không bao giờ dùng tới
+    // cặp đáp án có sẵn trong API. Chèn cùng nhánh đó vào đây (trước khi tốn
+    // ảnh + token AI) và nhả khóa đúng cách nếu nó xử lý xong.
+    try {
+      if (isCocosGame()) {
+        let st0 = getGameBridgeStateDirect();
+        if (!st0 || !st0.questions || !st0.questions.length) {
+          requestGameBridgeSync();
+          await sleep(800);
+          st0 = getGameBridgeStateDirect();
+        }
+        if (st0 && st0.questions && st0.questions.length) {
+          const handled = await solveCocosGameWithApi();
+          if (handled) {
+            isSolving = false;
+            if (cb) await cb(true, null, false, false, false, false, false, false);
+            else releaseLock();
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[English Master AI] Cocos API path (F2) lỗi, rơi xuống AI:", e);
+    }
 
     isSolving = true;
     lastMatchingPairs = [];

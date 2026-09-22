@@ -334,6 +334,25 @@
     try { node.emit("click"); return true; } catch (e) { return false; }
   }
 
+  // BUG#35: click CDP là chuột THẬT → bị hit-test. Nếu một phần tử HTML của
+  // extension (bảng điều khiển) phủ lên toạ độ thẻ thì click bị nuốt và bot
+  // đứng im không lỗi. Trả về tên phần tử đang phủ (null nếu thẻ nằm trên
+  // canvas) để autoMatch báo cáo đúng thay vì lặng lẽ hết thời gian chờ.
+  function occluderAt(node) {
+    try {
+      const world = nodeWorld(node);
+      const pt = designToClient(world);
+      if (!pt.ok) return null;
+      const el = document.elementFromPoint(pt.x, pt.y);
+      if (!el) return null;
+      const cv = getCanvas();
+      if (cv && (el === cv || cv.contains(el))) return null;
+      const id = el.id ? "#" + el.id : "";
+      const cls = el.className ? "." + String(el.className).split(/\s+/)[0] : "";
+      return (el.tagName || "?") + id + cls;
+    } catch (e) { return null; }
+  }
+
   // Strip Cocos RichText markup: "<color=#000000>The achievements of vaccines.</color>"
   // → "The achievements of vaccines." (BUG#32: option text lives in RichText, so
   // the raw markup never matched the answer text from the game API).
@@ -696,34 +715,264 @@
     return all[0];
   }
 
-  async function autoMatch(pairs, runId) {
-    let done = 0, failed = 0;
-    for (let i = 0; i < pairs.length; i++) {
-      const a = pairs[i][0], b = pairs[i][1];
-      // BUG#25 (live 17/09/2026): modal lỗi hệ thống ("Mạng không ổn định" /
-      // "Thông báo") xuất hiện giữa chừng NUỐT mọi click — autoMatch vẫn báo
-      // hoàn thành nhưng server không ghi nhận cặp nào. Dismiss trước MỖI cặp
-      // (no-op rẻ khi không có popup) để cặp kế không bị no-op.
-      try { dismissSystemPopups(); } catch (e) {}
-      // Wait for EACH card to be live before clicking — clicking a card that is
-      // still animating in is a silent no-op and derails the whole round
-      // (observed live: "Wrong attempt" cascade → score 0).
-      const na = await waitForNodeByText(a, 6000);
-      if (na) { clickNode(na); done++; }
-      await sleep(getRandom(180, 320));
-      try { dismissSystemPopups(); } catch (e) {}
-      // Pass na as the exclusion: when two cards share the same text (Q/A echo
-      // pairs like "How do you do?"), the second click must land on the OTHER card.
-      const nb = await waitForNodeByText(b, 4000, na || undefined);
-      if (nb) { clickNode(nb); done++; }
-      else failed++;
-      // BUG#25: nhịp chậm hơn giữa các cặp — AnswerCheck dồn dập khiến IOE server
-      // trả lỗi "Mạng không ổn định" (live: modal hiện ngay sau cặp đầu).
-      await sleep(getRandom(600, 950));
-      window.postMessage({ __ioeBridge: true, type: "MATCH_PROGRESS", payload: { runId, pair: pairs[i], index: i, total: pairs.length, okA: !!na, okB: !!nb } }, window.location.origin);
+  // ---------- BUG#33 (live 22/09/2026, ghep-cap — "Bài thi số 3", 6 cặp / 12 thẻ) ----------
+  // Vòng trước chỉ được 10/60 rồi POPUP_ENDGAME giữa chừng. Đọc thẳng mã nguồn
+  // game (assets/resources/index.*.js → class Game12 + GamePlay) thay vì dò mù:
+  //   * Game12.onHandlerChooseAnswerCross: click 1 = CHỌN (selectCross1);
+  //     click 2 vào thẻ KHÁC = NỘP CẶP → rootGame.submit(...) và bật mask.active
+  //     (chặn click toàn màn hình) cho tới khi server trả lời.
+  //   * GamePlay.submit: ăn khi content(thẻ1) là prompt và answearArr[0] là
+  //     content(thẻ2) → cặp phải nộp ĐÚNG THỨ TỰ [prompt, answer].
+  //   * GamePlay.failAnswer: SAI KHÔNG kết thúc ngay — chỉ endGame khi
+  //     wrongPick * (totalPoint / tổng số thẻ) > 0.3 * totalPoint. Với 12 thẻ
+  //     (60 điểm) là 4 lần sai. Các click dò của vòng trước đốt hết ngân sách
+  //     sai nên ván tự kết thúc — không phải lỗi cơ chế ghép cặp.
+  //   * Game12.continue(e): chỉ khi e=true (server xác nhận ăn) mới đặt
+  //     Button.interactable=false cho 2 thẻ vừa ghép → đó là dấu hiệu "đã ghép"
+  //     đáng tin để bỏ qua ở lượt chạy lại.
+  // ⇒ autoMatch giờ chạy theo STATE của game: chờ mask tắt trước mỗi click,
+  //   không click thẻ đã ghép/đang chọn, nộp đúng thứ tự [prompt, answer], đọc
+  //   kết quả thật sau mỗi cặp, và DỪNG trước khi chạm ngân sách sai.
+  function findGame12Controller() {
+    const cc = getCC();
+    if (!cc || !cc.Component) return null;
+    for (const n of allNodes()) {
+      if (!n || n.activeInHierarchy === false) continue;
+      try {
+        const comps = n.getComponents ? n.getComponents(cc.Component) : [];
+        for (const c of comps) {
+          if (c && typeof c.onHandlerChooseAnswerCross === "function") return c;
+        }
+      } catch (e) {}
     }
-    window.postMessage({ __ioeBridge: true, type: "MATCH_DONE", payload: { runId, done, failed, total: pairs.length } }, window.location.origin);
-    return { done, failed };
+    return null;
+  }
+
+  // Một click qua CDP là fire-and-forget, nên "click có ăn không?" chỉ trả lời
+  // được bằng cách đọc lại chính state của game.
+  function readMatchCard(card) {
+    if (!card || card.isValid === false) return null;
+    const cc = getCC();
+    let text = null;
+    try { text = labelOf(card); } catch (e) {}
+    let sel = false;
+    try {
+      const a = card.getChildByName && card.getChildByName("active");
+      sel = !!(a && a.activeInHierarchy !== false);
+    } catch (e) {}
+    let interactable = true;
+    try {
+      const b = cc && cc.Button && card.getComponent && card.getComponent(cc.Button);
+      if (b) interactable = b.interactable !== false;
+    } catch (e) {}
+    // BUG#34: thẻ ẢNH (ghép chữ↔ảnh) KHÔNG có cc.Label — Game12 ẩn node "txt"
+    // và bật "image", nên chỉ còn `dataAnswer` để nhận diện. Đọc thẳng đúng hai
+    // trường mà GamePlay.submit so sánh: content.content và ans.
+    let dataAnswer = null;
+    try { dataAnswer = card.dataAnswer || null; } catch (e) {}
+    let content = null, ans = null;
+    try { content = dataAnswer && dataAnswer.content ? (dataAnswer.content.content || null) : null; } catch (e) {}
+    try { ans = dataAnswer && dataAnswer.ans ? dataAnswer.ans : null; } catch (e) {}
+    // Ảnh: node con "image" đang bật (Game12 tắt "txt" cho thẻ ảnh).
+    let isImage = false;
+    try {
+      const img = card.getChildByName && card.getChildByName("image");
+      if (img && img.activeInHierarchy !== false) isImage = true;
+      const t = card.getChildByName && card.getChildByName("txt");
+      if (t && t.activeInHierarchy === false) isImage = true;
+    } catch (e) {}
+    if (typeof ans === "string" && /\.(png|jpe?g|gif|webp|bmp)(\?|$)/i.test(ans)) isImage = true;
+    return { node: card, text, sel, interactable, dataAnswer, content, ans, isImage };
+  }
+
+  function matchState() {
+    const g = findGame12Controller();
+    if (!g) return null;
+    const kids = (g.ctnCross && g.ctnCross.children) || [];
+    const cards = [];
+    for (const k of kids) { const c = readMatchCard(k); if (c) cards.push(c); }
+    return {
+      controller: g,
+      cards,
+      sel1: readMatchCard(g.selectCross1),
+      maskOn: !!(g.mask && g.mask.activeInHierarchy !== false),
+      remaining: (typeof g.count === "number") ? g.count : null,
+      wrongPick: (typeof g.wrongPick === "number") ? g.wrongPick : 0,
+      total: cards.length,
+    };
+  }
+
+  const normMatchText = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+
+  // BUG#34: một thẻ khớp "khoá" nào? Thẻ chữ khớp theo Label; thẻ ảnh khớp
+  // theo dataAnswer.ans (URL ảnh). Trả về true/false để dùng cho cả find lẫn
+  // phát hiện "đã ghép".
+  function cardMatchesKey(c, key) {
+    if (!c || key == null) return false;
+    const k = String(key);
+    if (c.text === k) return true;
+    if (c.content === k || c.ans === k) return true;
+    if (c.text && normMatchText(c.text) === normMatchText(k)) return true;
+    return false;
+  }
+
+  // Thẻ theo đúng khoá, KHÔNG lọc trạng thái (dùng để phát hiện "đã ghép").
+  function cardByTextAny(text) {
+    const st = matchState();
+    if (!st) return null;
+    return st.cards.find(c => cardMatchesKey(c, text)) || null;
+  }
+
+  // Thẻ còn dùng được cho khoá này: chưa ghép (interactable), chưa chọn, không
+  // nằm trong danh sách loại trừ.
+  function findMatchCard(text, excludeNodes) {
+    const st = matchState();
+    if (st && st.cards.length) {
+      const ex = excludeNodes || [];
+      const usable = st.cards.filter(c => c.interactable && !c.sel && ex.indexOf(c.node) < 0);
+      const hit = usable.find(c => cardMatchesKey(c, text));
+      if (hit) return hit.node;
+    }
+    return pickTextNode(text, (excludeNodes || [])[0]);
+  }
+
+  async function waitMaskClear(timeoutMs = 5000) {
+    const t0 = Date.now();
+    for (;;) {
+      const st = matchState();
+      if (!st) return null;
+      if (!st.maskOn) return st;
+      if (Date.now() - t0 > timeoutMs) return st;
+      await sleep(150);
+    }
+  }
+
+  async function waitForSelection(node, timeoutMs) {
+    const t0 = Date.now();
+    for (;;) {
+      const st = matchState();
+      if (st && st.sel1 && st.sel1.node === node) return true;
+      if (Date.now() - t0 > timeoutMs) return false;
+      await sleep(150);
+    }
+  }
+
+  // Server phán cặp vừa nộp: count giảm 2 = ăn; wrongPick tăng = trượt.
+  async function waitPairResolved(remainBefore, wrongBefore, timeoutMs) {
+    const t0 = Date.now();
+    for (;;) {
+      const st = matchState();
+      if (!st) return { ok: null, st: null };
+      if (typeof st.remaining === "number" && typeof remainBefore === "number" && st.remaining <= remainBefore - 2) return { ok: true, st };
+      if (st.wrongPick > wrongBefore) return { ok: false, st };
+      if (Date.now() - t0 > timeoutMs) return { ok: null, st };
+      await sleep(200);
+    }
+  }
+
+  async function autoMatch(pairs, runId) {
+    let matched = 0, failed = 0, skipped = 0;
+    const emitProgress = (i, extra) => window.postMessage({
+      __ioeBridge: true, type: "MATCH_PROGRESS",
+      payload: Object.assign({ runId, pair: pairs[i], index: i, total: pairs.length }, extra || {}),
+    }, window.location.origin);
+
+    let wrongBudget = null;
+
+    for (let i = 0; i < pairs.length; i++) {
+      // BUG#33b: bọc TỪNG cặp trong try/catch — trước đây một lỗi bất ngờ ở giữa
+      // (property chết, node bị huỷ khi ván kết thúc...) ném ra ngoài vòng lặp,
+      // autoMatch thoát mà KHÔNG gửi MATCH_DONE ⇒ solver ở isolated world chờ
+      // tới hết waitMs rồi mới biết (live: kẹt 4/6 cặp, không rõ cặp nào).
+      try {
+      let prompt = pairs[i][0], answer = pairs[i][1];
+
+      // BUG#25: modal lỗi hệ thống ("Mạng không ổn định") NUỐT mọi click.
+      try { dismissSystemPopups(); } catch (e) {}
+
+      // Cặp đã ăn ở lượt trước? Cả 2 thẻ đều interactable=false ⇒ bỏ qua.
+      const pa0 = cardByTextAny(prompt), pb0 = cardByTextAny(answer);
+      if (pa0 && pb0 && !pa0.interactable && !pb0.interactable) {
+        matched++;
+        emitProgress(i, { already: true });
+        continue;
+      }
+
+      // (a) Chờ game sẵn sàng nhận click (mask tắt = không có submit đang bay).
+      let st = await waitMaskClear(5000);
+      if (st) {
+        if (wrongBudget === null) wrongBudget = Math.floor(0.3 * Math.max(1, st.total));
+        // (d) Dừng TRƯỚC khi chạm ngân sách sai — thà thiếu cặp còn hơn kết thúc ván.
+        if (st.wrongPick >= wrongBudget) { skipped = pairs.length - i; break; }
+      }
+
+      // BUG#34: GamePlay.submit lấy `content` từ thẻ NÀO CÓ content, còn `ans`
+      // ưu tiên thẻ A. Ở vòng ghép chữ↔ảnh, thẻ CHỮ có content còn thẻ ẢNH chỉ
+      // có ans ⇒ bắt buộc click thẻ chữ TRƯỚC. Tự đảo nếu API trả ngược.
+      const ca0 = cardByTextAny(prompt), cb0 = cardByTextAny(answer);
+      if (ca0 && cb0 && !ca0.content && cb0.content) {
+        prompt = pairs[i][1]; answer = pairs[i][0];
+      }
+
+      // (b) Chọn thẻ prompt (thẻ mang `content`).
+      let ca = findMatchCard(prompt, []);
+      if (!ca) { failed++; emitProgress(i, { okA: false, okB: false, reason: "no_card_a" }); continue; }
+      // BUG#35: thẻ bị phần tử HTML của extension phủ lên → click sẽ bị nuốt.
+      // Báo rõ thay vì đứng chờ vô ích (đã sửa CSS panel thành pointer-events:none;
+      // đây là lưới an toàn nếu có overlay khác của trang/extension chèn vào).
+      const occA = occluderAt(ca);
+      if (occA) { failed++; emitProgress(i, { okA: false, okB: false, reason: "occluded_a", occluder: occA }); continue; }
+      clickNode(ca);
+      let selOk = await waitForSelection(ca, 3000);
+      if (!selOk) {
+        // Click không ăn (popup/animation chen ngang) → dọn rồi thử lại 1 lần.
+        try { dismissSystemPopups(); } catch (e) {}
+        await waitMaskClear(3000);
+        ca = findMatchCard(prompt, []);
+        if (ca) { clickNode(ca); selOk = await waitForSelection(ca, 3000); }
+      }
+      if (!selOk) { failed++; emitProgress(i, { okA: false, okB: false, reason: "sel_a_failed" }); continue; }
+
+      await sleep(getRandom(150, 280));
+
+      // (c) Thẻ answer — KHÁC thẻ vừa chọn, nộp đúng thứ tự [prompt, answer].
+      const cb = findMatchCard(answer, [ca]);
+      if (!cb) {
+        // Nhả thẻ prompt ra rồi bỏ qua cặp này (KHÔNG đốt ngân sách sai).
+        try { clickNode(ca); } catch (e) {}
+        failed++;
+        emitProgress(i, { okA: true, okB: false, reason: "no_card_b" });
+        continue;
+      }
+
+      const before = matchState() || {};
+      const wrongBefore = before.wrongPick || 0;
+      const remainBefore = before.remaining;
+      clickNode(cb);
+
+      // Chờ submit bay + server phán, rồi đọc kết quả thật của cặp này.
+      await sleep(250);
+      await waitMaskClear(8000);
+      const r = await waitPairResolved(remainBefore, wrongBefore, 6000);
+      if (r.ok === false) failed++; else matched++;
+      emitProgress(i, {
+        okA: true, okB: true, matched: r.ok === true,
+        wrongPick: (r.st && r.st.wrongPick) || 0,
+      });
+
+      if (r.st && typeof r.st.remaining === "number" && r.st.remaining <= 0) break; // hết thẻ
+      // BUG#25: nhịp chậm giữa các cặp — AnswerCheck dồn dập khiến IOE trả "Mạng không ổn định".
+      await sleep(getRandom(400, 700));
+      } catch (e) {
+        // Một cặp lỗi KHÔNG được phép giết cả ván ghép — ghi nhận rồi đi tiếp.
+        failed++;
+        console.warn("[IOE bridge] autoMatch cặp " + (i + 1) + " lỗi:", e && e.message);
+        emitProgress(i, { reason: "exception", error: (e && e.message) || String(e) });
+      }
+    }
+
+    window.postMessage({ __ioeBridge: true, type: "MATCH_DONE", payload: { runId, done: matched, failed, skipped, total: pairs.length } }, window.location.origin);
+    return { done: matched, failed, skipped };
   }
 
   function getRandom(min, max) {
