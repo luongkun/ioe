@@ -1,5 +1,5 @@
 /**
- * English Master AI - Dedicated IOE Universal Game Solver v3.7
+ * English Master AI - Dedicated IOE Universal Game Solver v3.8
  * Supports: True/False Listening (Dọn rác bãi biển), Matching Pairs (Ghép Cặp 12 ô), MCQ (Tái tạo san hô, Fansipan, Leo núi), Long Reading Passage Auto-Scroll & Extraction
  */
 
@@ -7,7 +7,7 @@
   if (window.__IOE_MASTER_LOADED__) return;
   window.__IOE_MASTER_LOADED__ = true;
 
-  console.log("%c[English Master AI v3.7] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
+  console.log("%c[English Master AI v3.8] IOE True/False, MCQ & Reading Passage Engine Active!", "color: #10b981; font-weight: bold; font-size: 14px;");
 
   // 1. Super Unblocker
   function superUnblockAll() {
@@ -1450,7 +1450,7 @@
     ioeRootEl.innerHTML = `
       <div class="ioe-control-pill" id="ioe-pill-toggle">
         <div class="ioe-badge-icon">IOE</div>
-        <span class="ioe-pill-title">English Master v3.7</span>
+        <span class="ioe-pill-title">English Master v3.8</span>
         <span id="ioe-audio-detected-badge" class="ioe-audio-pill hidden" title="Phát hiện bài thi nghe">🎧 Audio</span>
         <span id="ioe-game-api-badge" class="ioe-api-pill hidden" title="Đã đọc đề trực tiếp từ API game">🎮 API</span>
         <div class="ioe-pill-btn-group">
