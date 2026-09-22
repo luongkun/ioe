@@ -1693,6 +1693,51 @@
     return { ok: false };
   }
 
+  // BUG#37 (live 22/09/2026, hanh-tinh-tim, Vòng 4 Bài 2): game nộp từng câu qua
+  // AnswerCheck rồi tự chuyển câu, NHƯNG hết câu cuối thì KHÔNG có nút nào để bấm
+  // nộp cả bài — trong scene không tồn tại node "btnSubmit"/"nameSubmit" (dump
+  // toàn bộ tên node active chỉ có btnA/btnClose/btn_container/btn_home/audioBtn).
+  // Đường nộp thật nằm trong GamePlay.onClimbNextCheckPoint:
+  //     currentQuestionId >= questionArr.length  →  this.endGame()
+  // endGame() POST FINISH_GAME (đúng payload {examKey, ans, token, ...}) rồi
+  // showEndGameScene → PopupEndGame. Vì vậy phải gọi THẲNG endGame() của component
+  // GamePlay. Dò theo prototype (constructor.name bị minify thành "t"/"CCClass"
+  // nên KHÔNG so tên class được — chính vì thế nhánh cũ dò currentQuestionNumber
+  // không thấy GamePlay): nhận diện bằng bộ đôi questComs + currentQuestionId,
+  // đúng 2 field mà onClimbNextCheckPoint đọc.
+  function findGamePlay() {
+    const cc = getCC();
+    if (!cc || !cc.director || !cc.director.getScene) return null;
+    let found = null;
+    (function walk(n) {
+      if (!n || found) return;
+      try { if (n.activeInHierarchy === false) return; } catch (e) {}
+      const comps = n._components || n.components;
+      if (comps) for (const c of comps) {
+        if (c && Array.isArray(c.questComs) && c.currentQuestionId !== undefined && typeof c.endGame === "function") { found = c; return; }
+      }
+      const kids = n.children;
+      if (kids) for (let i = 0; i < kids.length; i++) walk(kids[i]);
+    })(cc.director.getScene());
+    return found;
+  }
+
+  // Nộp cả bài bằng chính hàm endGame() của game (POST FINISH_GAME). Trả về
+  // isEndGame sau khi chờ — true nghĩa là server đã nhận và game đã dựng popup.
+  async function finishGameDirect() {
+    try { dismissSystemPopups(); } catch (e) {}
+    const gp = findGamePlay();
+    if (!gp) return { ok: false, reason: "no_gameplay" };
+    const before = gp.isEndGame === true;
+    try { gp.endGame(); } catch (e) { return { ok: false, reason: "throw:" + (e && e.message) }; }
+    // endGame là POST bất đồng bộ → chờ tối đa ~6s cho isEndGame bật.
+    for (let i = 0; i < 24; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      try { if (gp.isEndGame === true) return { ok: true, alreadyEnded: before }; } catch (e) { break; }
+    }
+    return { ok: false, reason: "no_endgame_ack", alreadyEnded: before };
+  }
+
   // BUG#30c (nh-tim/hanh-tinh-tim transform, 17/09/2026): nút ANSWER của game
   // biến đổi câu = controller.onKeyEnterPress — nhưng validation isAnswerAll()
   // đòi MỖI từ phải dài ĐÚNG maxLength của ô (live-verified: 'aaa' vào ô
@@ -1810,6 +1855,9 @@
         case "CLICK_ANSWER_BTN":
           reply(reqId, "CLICK_ANSWER_BTN_OK", clickAnswerButton());
           break;
+        case "FINISH_GAME":
+          reply(reqId, "FINISH_GAME_OK", await finishGameDirect());
+          break;
         default:
           break;
       }
@@ -1836,7 +1884,10 @@
     readGameScreen: readGameScreen,
     fillEditBoxes: fillEditBoxes,
     submitCloze: submitCloze,
-    clickAnswerButton: clickAnswerButton
+    clickAnswerButton: clickAnswerButton,
+    // BUG#37: nộp cả bài bằng endGame() của chính game (game không có nút submit).
+    finishGame: finishGameDirect,
+    findGamePlay: findGamePlay
   };
 
   // Announce readiness so the isolated script can request a re-sync if needed.

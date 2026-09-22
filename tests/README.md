@@ -8,6 +8,7 @@ Hạ tầng test E2E cho extension trên Chromium thật (không headless-new v�
 |------|----------|
 | `test_bug32_option_nodes.js` | **Chạy được bằng `node` thuần, KHÔNG cần Playwright/Xvfb/mạng.** Nạp thẳng các hàm thật từ `game-api-bridge.js` rồi chạy trên cây Cocos giả lập đúng cấu trúc live của `an-khe-tra-vang` (BUG#32: text đáp án và nút bấm là ANH EM, `AnswerButton` tuỳ biến, nút D tên `btnd` chữ thường). 13 assert. |
 | `test_bug33_match_state.js` | **Chạy được bằng `node` thuần.** Mô phỏng lại ĐÚNG máy trạng thái của game `ghep-cap` chép từ bundle đã tải (`assets/resources/index.*.js` → `Game12.onHandlerChooseAnswerCross` + `GamePlay.submit`/`failAnswer`/`continue`), rồi chạy `autoMatch` thật trên đó. Khoá: thứ tự nộp `[prompt, answer]`, guard tự đảo khi API trả ngược, bỏ qua cặp đã ghép, DỪNG trước ngân sách sai (4 lần sai = hết ván), và ghép CHỮ↔ẢNH (BUG#34). 19 assert. |
+| `test_bug37_gameplay_finish.js` | **Chạy được bằng `node` thuần.** Nạp thẳng `findGamePlay` + `finishGameDirect` từ `game-api-bridge.js` rồi chạy trên cây Cocos giả lập. Khoá BUG#37: nhận diện GamePlay bằng BỘ ĐÔI field (`questComs` + `currentQuestionId` + `endGame`) chứ KHÔNG bằng tên class (bị minify thành `"t"`), bỏ qua node inactive, chờ bất đồng bộ `isEndGame`, không báo thành công giả khi POST hỏng, và không nộp đôi. 14 assert. |
 | `test_extension.js` | Suite 12 test trên trang giả lập (pill inject, bridge inject, anti-copy, MCQ solve+autoclick, F2, fill, reorder, mixed, pageerror) |
 | `test_fillword.js` | Suite 11 test E2E dạng **nghe điền từ** (EditBox Cocos) + **trắc nghiệm nhiều câu** + cache câu hỏi + chip click không ReferenceError |
 | `test_ai_key_failure.js` | Suite 14 test E2E **đường AI Gemini THẬT khi key chưa nhập / sai / placeholder** (BUG#16/#17): không gán nhãn "quá tải" cho key sai, không render bảng "1.? 2.? 3.?", có hướng dẫn lấy key, thoát nhanh. Cần bản extension `ioe-bugtest` (copy ioe-test rồi `MOCK_GEMINI = false`) — chạy `node tests/test_ai_key_failure.js before|after` |
@@ -18,7 +19,9 @@ Hạ tầng test E2E cho extension trên Chromium thật (không headless-new v�
 ## Test chạy ngay (không cần cài gì)
 
 ```bash
-node tests/test_bug32_option_nodes.js   # 13/13 PASS — logic tra node đáp án
+node tests/test_bug32_option_nodes.js    # 13/13 PASS — logic tra node đáp án
+node tests/test_bug33_match_state.js     # 19/19 PASS — máy trạng thái ghép cặp
+node tests/test_bug37_gameplay_finish.js # 14/14 PASS — nộp bài qua GamePlay.endGame()
 ```
 
 ## Tái lập môi trường test (từ repo trống)

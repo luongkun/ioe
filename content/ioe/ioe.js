@@ -612,19 +612,13 @@
       await sleep(getRandomHumanDelay(600, 1100));
     }
 
-    // Nộp CẢ BÀI: btnSubmit → popup xác nhận → nameSubmit
-    const s1 = await ioeBridgeRequest("CLICK_NAME", { name: "btnSubmit" }, 8000);
-    await sleep(1800); // popup xác nhận hiện
-    let submitted = false;
-    for (let attempt = 0; attempt < 3 && !submitted; attempt++) {
-      const s2 = await ioeBridgeRequest("CLICK_NAME", { name: "nameSubmit" }, 8000);
-      if (s2 && s2.payload && s2.payload.ok) {
-        submitted = true;
-      } else {
-        await sleep(1800);
-        if (attempt === 1) await ioeBridgeRequest("CLICK_NAME", { name: "btnSubmit" }, 8000); // popup có thể chưa mở → bấm lại
-      }
-    }
+    // Nộp CẢ BÀI: btnSubmit → popup xác nhận → nameSubmit, rồi BUG#37
+    // (GamePlay.endGame()) làm lưới an toàn cho game không có nút submit.
+    // Live 22/09/2026 chinh-phuc-fansipan (Vòng 7 Bài 2): chọn đủ 10 câu, điểm
+    // trên HUD đã là 70 nhưng scene KHÔNG có btnSubmit/nameSubmit → nhánh cũ trả
+    // submitted=false và game đứng im, điểm không được ghi. tryFinishGameSubmit
+    // gọi endGame() → POST FINISH_GAME (đã kiểm chứng cùng ngày).
+    const submitted = await tryFinishGameSubmit("Đọc hiểu True/False");
     if (submitted) showToast(`✅ Đã chọn ${done}/${qs.length} câu + nộp bài! Chờ game chấm...`);
     else showToast(`📖 Đã chọn ${done}/${qs.length} câu — không thấy nút xác nhận nộp, hãy nộp thủ công nếu cần`);
     console.log("[English Master AI] 📖 Reading TF:", JSON.stringify({ done, submitted, answers }));
@@ -932,6 +926,19 @@
         await sleep(1500);
       }
     }
+    // 3. BUG#37 (live 22/09/2026, hanh-tinh-tim): game KHÔNG có nút nộp nào trong
+    // scene (đã dump tên node active). Đường nộp thật là GamePlay.endGame() —
+    // game tự gọi nó khi hết câu cuối, nhưng solver đã đặt currentQuestionId
+    // lệch nên không kích hoạt. Gọi thẳng endGame() qua bridge → POST FINISH_GAME
+    // → server nhận điểm → popup kết quả. Nhánh này chạy SAU 1+2 nên không phá
+    // các game có nút thật.
+    if (!lastFinishGameAt || Date.now() - lastFinishGameAt >= 30000) {
+      const fg = await ioeBridgeRequest("FINISH_GAME", {}, 12000);
+      if (fg && fg.payload && fg.payload.ok) {
+        await sleep(1200);
+        submitted = true;
+      }
+    }
     if (lastFinishGameAt && Date.now() - lastFinishGameAt < 30000) {
       submitted = true;
       showToast(`✅ ${label || "Bài"}: game đã chấm xong!`);
@@ -1030,6 +1037,10 @@
       showToast(`✍️ Câu ${solved}/${total}: ${words.join(" | ")}${submittedOk ? " + nộp" : " (chưa nộp được)"}`);
       await sleep(getRandomHumanDelay(3500, 5000));
     }
+    // BUG#37 (live 22/09/2026): hết câu cuối game KHÔNG tự nộp — không có nút
+    // submit trong scene. Phải gọi GamePlay.endGame() để POST FINISH_GAME, nếu
+    // không điểm KHÔNG được ghi lại (live: bài 100/100 nhưng bảng tu-luyen vẫn 0).
+    if (solved > 0) await tryFinishGameSubmit("Biến đổi câu");
     return solved > 0;
   }
 
