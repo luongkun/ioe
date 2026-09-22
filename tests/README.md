@@ -44,6 +44,7 @@ node tests/test_bug32_option_nodes.js   # 13/13 PASS — logic tra node đáp á
 3. Playwright tự chèn `--disable-extensions` → phải `ignoreDefaultArgs: ['--disable-extensions']` (khi launch qua Playwright; script này tự spawn Chrome nên không cần).
 4. `/dev/shm` 64MB làm renderer crash → `--disable-dev-shm-usage`; WebGL cho Cocos cần `--use-angle=swiftshader` (nếu test game thật).
 5. Token game IOE **single-use**: mở lại tab game cũ → getinfo trả "Bạn không có quyền" (bridge giờ phát sự kiện GETINFO_ERROR và UI báo F5).
+6. **`chrome.runtime.reload()` KHÔNG nạp lại extension unpacked chạy bằng `--load-extension`.** Nó gỡ extension khỏi Chrome và KHÔNG đọc lại từ đĩa → `service_worker` target biến mất, content script không còn inject (bridge `undefined`). Muốn nạp code mới: **tắt hẳn Chrome rồi chạy lại lệnh `chromium --load-extension=...`**. (Đã dính 22/09/2026 khi test BUG#32.) Cách ly nhanh không cần nạp lại: trích thẳng hàm từ file bằng `node` rồi chạy trên cây Cocos giả lập — xem `test_bug32_option_nodes.js`.
 
 ## Test trên ioe.vn THẬT
 
