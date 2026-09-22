@@ -1374,6 +1374,22 @@
   // BUG#26 (chim-hai-tao): các ô chuyển câu chia sẻ tên node "btn_quest_item",
   // phân biệt bằng label con "1".."N" — CLICK_TEXT "2" có thể trúng nút khác
   // (số câu trùng số thứ tự đáp án MCQ). RPC riêng cho solver đọc hiểu TF.
+  // BUG#40: đếm node btn_quest_item đang active (ô chuyển câu). 0 = game hiển thị
+  // một câu một màn; ≥2 = nhiều câu trên cùng màn, solver phải chuyển câu.
+  function countQuestItems() {
+    const cc = getCC();
+    if (!cc || !cc.director || !cc.director.getScene) return 0;
+    let n = 0;
+    (function walk(x) {
+      if (!x) return;
+      try { if (x.activeInHierarchy === false) return; } catch (e) {}
+      if (x.name === "btn_quest_item") n++;
+      const kids = x.children;
+      if (kids) for (let i = 0; i < kids.length; i++) walk(kids[i]);
+    })(cc.director.getScene());
+    return n;
+  }
+
   function clickQuestItem(index) {
     const cc = getCC();
     if (!cc || !cc.director || !cc.director.getScene || index === undefined || index === null) return { ok: false, reason: "bad_args" };
@@ -1387,7 +1403,26 @@
       const kids = n.children;
       if (kids) for (let i = 0; i < kids.length; i++) walk(kids[i]);
     })(cc.director.getScene());
-    if (!found) return { ok: false, reason: "no_item_" + target };
+    // BUG#40 (live 22/09/2026, an-khe-tra-vang — Vòng 3 Bài 2): đường khớp THEO
+    // TEXT ở trên chỉ đúng khi ô chuyển câu có Label mang số ("1".."N"). Game
+    // này vẽ số bằng SPRITE ⇒ nodeText() trả null ⇒ no_item_N → solver đứng mãi
+    // ở câu 1 dù đã click đủ 5 đáp án (live: panel hiện 5 đáp án đúng, điểm 0).
+    // Fallback: đánh số các node btn_quest_item ĐANG ACTIVE theo đúng thứ tự
+    // duyệt (trái→phải, đã kiểm chứng live: tab2 ở x=279 đổi câu 1→2) rồi click
+    // node thứ `index`. Đã kiểm chứng click TRUSTED vào toạ độ tab hoạt động.
+    if (!found) {
+      const items = [];
+      (function walk(n) {
+        if (!n) return;
+        try { if (n.activeInHierarchy === false) return; } catch (e) {}
+        if (n.name === "btn_quest_item") items.push(n);
+        const kids = n.children;
+        if (kids) for (let i = 0; i < kids.length; i++) walk(kids[i]);
+      })(cc.director.getScene());
+      const want = parseInt(target, 10);
+      if (items.length >= want && want >= 1) found = items[want - 1];
+      if (!found) return { ok: false, reason: "no_item_" + target + "_of_" + items.length };
+    }
     return clickNode(found) ? { ok: true } : { ok: false, reason: "click_failed" };
   }
 
@@ -1415,6 +1450,52 @@
     if (!n) return { ok: false, reason: "not_found" };
     return clickNode(n) ? { ok: true, node: n.name, via } : { ok: false, reason: "click_failed" };
   }
+  // BUG#38 (live 22/09/2026, chim-hai-tao Vòng 1 Bài 1 — tài khoản test 2):
+  // bài ĐỌC HIỂU để đoạn văn và câu hỏi trong HAI node RichText RIÊNG BIỆT
+  // ("conv_content_scroll" = đoạn văn, "ask_content_no_scroll" = câu hỏi),
+  // mỗi node chứa nhiều node con "RICHTEXT_CHILD". readGameScreen() gom MỌI
+  // RICHTEXT_CHILD rồi sắp theo toạ độ y → hai khối ĐAN XEN NHAU:
+  //     "Percy Ross is the only Percy Ross was one of the most famous
+  //      millionaire who has millionaires who gave away all their money to
+  //      given away all his help others. Ross was born in 1916..."
+  // ⇒ AI nhận văn bản RÁC. Tệ hơn: solveReadingTfExam chỉ lấy passage từ
+  // payload.des = controller.desStrContent, mà game này KHÔNG có controller
+  // (đã kiểm chứng: readGameScreen() không hề có key "des") ⇒ passage RỖNG
+  // ⇒ AI đoán True/False không có ngữ cảnh. Trong khi đoạn văn SẠCH 670 ký tự
+  // vẫn nằm nguyên trong node conv_content_scroll.
+  // Hàm này đọc theo TÊN NODE (nguồn đáng tin nhất), có fallback.
+  function getPassageText() {
+    const cc = getCC();
+    if (!cc || !cc.director || !cc.director.getScene) return "";
+    // Tên node chứa đoạn văn, ưu tiên từ trên xuống (đã gặp trên live).
+    const PASSAGE_NODES = ["conv_content_scroll", "content_scroll", "conv_content", "scrollRtext"];
+    const nodes = [];
+    (function walk(n, d) {
+      if (!n || d > 90) return;
+      nodes.push(n);
+      (n.children || []).forEach(c => walk(c, d + 1));
+    })(cc.director.getScene(), 0);
+    for (const name of PASSAGE_NODES) {
+      for (const n of nodes) {
+        try { if (n.activeInHierarchy === false) continue; } catch (e) { continue; }
+        if (n.name !== name) continue;
+        // labelOf đã stripRichText → đoạn văn liền mạch, không dính markup.
+        const t = labelOf(n) || nodeText(n, 12);
+        if (t && String(t).trim().length >= 40) return String(t).trim();
+      }
+    }
+    // Fallback: controller (game đọc hiểu đời cũ có desStrContent).
+    try {
+      const qc = findQuestControllerComponent();
+      if (qc) {
+        const strip = (s) => String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        const des = strip(qc.desStrContent);
+        if (des && des.length >= 40) return des;
+      }
+    } catch (e) {}
+    return "";
+  }
+
   function currentQuestionInfo() {
     const cc = getCC();
     const labels = scanLabels();
@@ -1436,6 +1517,13 @@
         if (qc.canClick !== undefined) out.canClick = !!qc.canClick;
       }
     } catch (e) {}
+
+    // BUG#38: `des` PHẢI luôn có khi game có đoạn văn — nhánh controller ở trên
+    // chỉ chạy khi game CÓ controller, còn game đọc hiểu mới (chim-hai-tao) thì
+    // không. Đọc thẳng từ node conv_content_scroll.
+    if (!out.des) {
+      try { const p = getPassageText(); if (p) out.des = p; } catch (e) {}
+    }
 
     // 1a. Separate counter labels (live 17/09/2026, bach-tuoc-thu-ngoc):
     //     lblCurrent "1" + lbl_total_quest "10" — hai label RỜI, không có
@@ -1556,6 +1644,12 @@
     })(cc.director.getScene(), 0);
     // RICHTEXT_CHILD theo vị trí
     const rts = [];
+    // BUG#42 (live 22/09/2026, cuon-giay-bi-an — Vòng 6 Bài 2): game cloze vẽ mỗi
+    // ô trống bằng một node con tên SELECT_RICH_TEXT_CHILD_NAME, KHÔNG phải
+    // RICHTEXT_CHILD → đoạn văn gom được bị MẤT HẾT marker "(n)____" ("He had and
+    // lots of ideas..."), AI không biết từ nào vào ô nào. Gom riêng rồi chèn lại
+    // theo toạ độ ở nhánh cloze bên dưới.
+    const clozeMarks = [];
     for (const n of nodes) {
       let active = true;
       try { active = n.activeInHierarchy !== false; } catch (e) {}
@@ -1566,6 +1660,7 @@
           const t = String(l.string).trim();
           if (n.name === "number_lbl" && /^\d+$/.test(t)) out.qNumber = parseInt(t, 10);
           if (n.name === "RICHTEXT_CHILD" && t) rts.push({ t, w: nodeWorld(n) });
+          else if (t && n.parent && n.parent.name === "SELECT_RICH_TEXT_CHILD_NAME") clozeMarks.push({ t, w: nodeWorld(n) });
         }
       } catch (e) {}
       if (n.name === "btnA" || n.name === "submit") {
@@ -1621,6 +1716,30 @@
       out.wordBank = out.cloze._lstAnswers || null;
       out.clozeBlanks = (out.cloze._lstSelect || []).length;
       delete out.cloze; // không serialise component
+      // BUG#42: chèn marker "(n)____" trở lại đúng chỗ trong đoạn văn, dùng toạ độ
+      // của node marker so với các mảnh RICHTEXT_CHILD (sort y giảm, x tăng — cùng
+      // quy tắc với nhánh rts ở trên). Không có bước này thì `first` là đoạn văn
+      // liền mạch không ô trống, AI không thể biết từ nào điền vào đâu.
+      if (clozeMarks.length && rts.length) {
+        const segs = rts.map(r => ({ t: r.t, w: r.w }));
+        for (const m of clozeMarks) segs.push({ t: m.t, w: m.w });
+        // Sort theo DÒNG, không sort thuần theo y: marker "(1)____" nằm cùng dòng
+        // với 2 mảnh text nhưng y lệch 2px (336 vs 338, do baseline khác nhau) →
+        // sort (b.y-a.y)||(a.x-b.x) đẩy marker xuống CUỐI dòng →
+        // "He had and lots of ideas... (1)____" → AI điền sai vị trí (60 điểm).
+        // Gom các mảnh có y trong cùng dải ±8px thành một dòng rồi mới xếp theo x.
+        const TOL = 8;
+        segs.sort((a, b) => b.w.y - a.w.y);
+        let line = 0;
+        for (let i = 1; i < segs.length; i++) {
+          if (segs[i - 1].w.y - segs[i].w.y > TOL) line++;
+          segs[i]._line = line;
+        }
+        segs[0]._line = 0;
+        segs.sort((a, b) => (a._line - b._line) || (a.w.x - b.w.x));
+        out.first = segs.map(s => s.t).join(" ");
+        out.clozeMarked = true;
+      }
     }
     return out;
   }
@@ -1666,16 +1785,24 @@
     try {
       const n = (ctrl._lstSelect || []).length;
       const chipWords = ctrl._lstAnswers || [];
+      // BUG#42: khớp từ KHÔNG phân biệt hoa/thường. AI hay trả "success" cho chip
+      // "Success" → indexOf = -1 → rơi vào nhánh `idx >= 0 ? idx : i` và gán bừa
+      // index = vị trí ô, tức là điền SAI TỪ mà vẫn báo ok. Đồng thời ghi lại
+      // unmatched để log ra biết AI trả từ lạ.
+      const unmatched = [];
       ctrl._lstSelect = (wordsPerBlank || []).slice(0, n).map((w, i) => {
-        const idx = chipWords.indexOf(w);
-        return { index: idx >= 0 ? idx : i, contents: w };
+        const raw = String(w == null ? "" : w);
+        let idx = chipWords.indexOf(raw);
+        if (idx < 0) idx = chipWords.findIndex(c => String(c).toLowerCase() === raw.toLowerCase());
+        if (idx < 0) unmatched.push(raw);
+        return { index: idx >= 0 ? idx : i, contents: idx >= 0 ? chipWords[idx] : raw };
       });
       while (ctrl._lstSelect.length < n) ctrl._lstSelect.push(null);
       try { ctrl._updateQuestionContainer && ctrl._updateQuestionContainer(); } catch (e) {}
       const selected = ctrl._isSelectedAll;
       if (!selected) return { ok: false, reason: "not all filled", select: ctrl._lstSelect };
       ctrl.onSubmitGame();
-      return { ok: true, submitted: true, select: ctrl._lstSelect.map(s => s && s.contents) };
+      return { ok: true, submitted: true, unmatched: unmatched, select: ctrl._lstSelect.map(s => s && s.contents) };
     } catch (e) {
       return { ok: false, reason: e.message };
     }
@@ -1780,6 +1907,67 @@
     }
   }
 
+  // BUG#45 (live 22/09/2026, chim-hai-tao — Vòng 7 Bài 4, 20/100):
+  //   audio-sniffer.js hook `fetch` / `XHR` / `new Audio()` nhưng chạy ở world
+  //   ISOLATED, còn Cocos tải asset ở world MAIN → sniffer KHÔNG BAO GIỜ thấy file
+  //   nghe (live: __LAST_CAPTURED_IOE_AUDIO__ rỗng suốt bài). Hậu quả: đề NGHE
+  //   bị phân loại reading_tf (API trả isListening:false, audio:null) → AI suy luận
+  //   chay từ câu khẳng định → 1/5 đúng.
+  //   Trong MAIN world ta ĐỌC ĐƯỢC URL thật qua performance.getEntriesByType("resource")
+  //   (live-verified: bắt đúng .../a3/a36d401a-....mp3, 1.13 MB). Trả về cho ISO để
+  //   gửi kèm audioUrls cho AI — không cần hook gì thêm.
+  function getAudioUrlsFromPerf() {
+    try {
+      const out = [];
+      for (const r of performance.getEntriesByType("resource")) {
+        const n = r.name || "";
+        if (!/\.(mp3|m4a|ogg|wav|aac)(\?|$)/i.test(n)) continue;
+        if (out.some(o => o.url === n)) continue;
+        // Kích thước để phân biệt BÀI NGHE với hiệu ứng âm thanh nhỏ (live: bài
+        // nghe 1.13 MB, hiệu ứng vài chục KB). transferSize = 0 khi lấy từ cache
+        // → lấy max của decoded/encoded cho chắc.
+        const size = Math.max(r.transferSize || 0, r.encodedBodySize || 0, r.decodedBodySize || 0);
+        out.push({ url: n, size });
+      }
+      // Bài nghe dài nhất/lớn nhất đứng đầu.
+      out.sort((a, b) => b.size - a.size);
+      return out;
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // BUG#45b (live 22/09/2026, chim-hai-tao — Vòng 7 Bài 4): đường BUG#45 đoán
+  // theo KÍCH THƯỚC file trong performance entries là SAI. File mp3 to nhất
+  // (1.13 MB) hoá ra là NHẠC NỀN của game — AudioManager._currentMusicUrl =
+  // "sounds/NhacNenGame" — nên AI được nghe nhạc nền và trả lời theo câu khẳng
+  // định, tiếp tục 20/100.
+  // Đường ĐÚNG: component AudioContent (node nAudioQuest) giữ trường `remoteSound`
+  // = URL bài nghe thật. Live-verified sau khi bấm SOUND_REPLAY_BTN:
+  //   https://cdn-s3.vtconline.vn/.../Lop11/Vong7/Amthanh/E11_V7_1.mp3
+  // Trước khi bấm thì remoteSound còn null → hàm này trả rỗng, caller phải bấm
+  // SOUND_REPLAY_BTN rồi đọc lại.
+  function getQuestAudioUrl() {
+    try {
+      let found = null;
+      const walk = (n, d) => {
+        if (found || d > 16) return;
+        try {
+          for (const c of (n._components || [])) {
+            const cn = (c && c.__classname__) || (c && c.constructor && c.constructor.name) || "";
+            if (/AudioContent/i.test(cn) && c.remoteSound) { found = String(c.remoteSound); return; }
+          }
+        } catch (e) {}
+        for (const ch of (n.children || [])) walk(ch, d + 1);
+      };
+      const sc = getCC() && getCC().director && getCC().director.getScene();
+      if (sc) walk(sc, 0);
+      return found;
+    } catch (e) {
+      return null;
+    }
+  }
+
   window.addEventListener("message", async (ev) => {
     if (ev.source && ev.source !== window) return;
     const d = ev.data;
@@ -1800,6 +1988,19 @@
         case "CURRENT_QUESTION":
           reply(reqId, "CURRENT_QUESTION_OK", currentQuestionInfo());
           break;
+        case "GET_PASSAGE":
+          // BUG#38: đoạn văn SẠCH (node conv_content_scroll), tách khỏi câu hỏi.
+          reply(reqId, "GET_PASSAGE_OK", { passage: getPassageText() });
+          break;
+        case "GET_AUDIO_URLS":
+          // BUG#45b: URL bài nghe THẬT lấy từ AudioContent.remoteSound (KHÔNG dùng
+          // kích thước file trong performance — file to nhất là nhạc nền).
+          reply(reqId, "GET_AUDIO_URLS_OK", { quest: getQuestAudioUrl(), urls: getAudioUrlsFromPerf() });
+          break;
+        case "PLAY_QUEST_AUDIO":
+          // BUG#45b: bấm nút replay để game nạp remoteSound (trước đó là null).
+          reply(reqId, "PLAY_QUEST_AUDIO_OK", clickNameSmart("SOUND_REPLAY_BTN"));
+          break;
         case "START_GAME":
           reply(reqId, "START_GAME_OK", await startGame());
           break;
@@ -1811,6 +2012,11 @@
           break;
         case "CLICK_QUEST_ITEM":
           reply(reqId, "CLICK_QUEST_ITEM_OK", clickQuestItem((d.data || {}).index));
+          break;
+        case "COUNT_QUEST_ITEMS":
+          // BUG#40: đếm ô chuyển câu đang active để biết game có nhiều câu trên
+          // một màn hay không (an-khe-tra-vang = 5, game một-câu-một-màn = 0).
+          reply(reqId, "COUNT_QUEST_ITEMS_OK", { count: countQuestItems() });
           break;
         case "AUTO_MATCH":
           reply(reqId, "AUTO_MATCH_STARTED", { total: ((d.data || {}).pairs || []).length });
@@ -1887,7 +2093,9 @@
     clickAnswerButton: clickAnswerButton,
     // BUG#37: nộp cả bài bằng endGame() của chính game (game không có nút submit).
     finishGame: finishGameDirect,
-    findGamePlay: findGamePlay
+    findGamePlay: findGamePlay,
+    // BUG#38: đoạn văn sạch cho bài đọc hiểu (tách khỏi câu hỏi).
+    getPassage: getPassageText
   };
 
   // Announce readiness so the isolated script can request a re-sync if needed.

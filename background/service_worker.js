@@ -18,7 +18,21 @@ const DEFAULT_CONFIG = {
   //         gemini-2.5-pro, gemini-3-pro-preview
   model: "gemini-3.6-flash",
   autoShowToolbar: true,
-  targetLanguage: "vi"
+  targetLanguage: "vi",
+  // BUG#46 (22/09/2026): Gemini free tier chỉ 20 request/PHÚT (đo thực tế:
+  // `generate_content_free_tier_requests, limit: 20`), mà mỗi bài thi solver gọi
+  // AI 5-10 lần + retry → cạn quota liên tục giữa bài. Gói Google AI Pro KHÔNG
+  // nâng hạn mức API (hạn mức tính theo PROJECT, muốn lên phải bật billing).
+  // Groq free tier: 30 RPM + 1000 request/NGÀY, không cần thẻ tín dụng.
+  //   - `openai/gpt-oss-120b`  → suy luận (text-only, không có vision)
+  //   - `whisper-large-v3-turbo` → nghe audio (20 RPM, 2000 request/ngày)
+  // Vì Groq không có vision, đường có ẢNH vẫn phải dùng Gemini; đường chỉ có
+  // CHỮ/AUDIO thì Groq chạy trước, Gemini là dự phòng.
+  groqApiKey: "",
+  groqModel: "openai/gpt-oss-120b",
+  groqWhisperModel: "whisper-large-v3-turbo",
+  // "groq" = Groq trước (tiết kiệm quota Gemini), "gemini" = Gemini trước.
+  preferProvider: "groq"
 };
 
 // Real, publicly available Gemini model IDs (aliases first — they track the
@@ -220,55 +234,149 @@ async function callSingleModel(modelName, apiKey, promptText, imageBase64 = null
   return candidate.content.parts[0].text;
 }
 
-async function callGeminiWithFallback(text, taskType, customApiKey, customModel, imageBase64 = null, audioObj = null, customHint = "", audioList = null, examKind = null) {
-  const config = await chrome.storage.local.get(DEFAULT_CONFIG);
-  let apiKey = customApiKey || config.geminiApiKey || DEFAULT_CONFIG.geminiApiKey;
-  apiKey = String(apiKey || "").trim();
-  const primaryModel = customModel || config.model || DEFAULT_CONFIG.model;
+// ===== BUG#46: Groq provider =====
+// Groq dùng API kiểu OpenAI (/openai/v1/chat/completions) — KHÁC Gemini ở 3 điểm
+// quan trọng khi chuyển đổi:
+//   1. System prompt là một message riêng (role:"system"), không nhồi vào user.
+//   2. Ảnh đi dạng content part {type:"image_url", image_url:{url:"data:..."}},
+//      và model chữ của Groq KHÔNG nhận ảnh (xem groqSupportsImages).
+//   3. AUDIO KHÔNG đi kèm chat completion — Groq tách riêng endpoint
+//      /openai/v1/audio/transcriptions (Whisper). Vì vậy audio được phiên âm
+//      TRƯỚC, rồi bản transcript được nhồi vào prompt chữ.
+const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 
-  // BUG#16: key rỗng hoặc placeholder ("YOUR_API_KEY_HERE" từ bản cũ) → hướng dẫn
-  // nhập key NGAY, không gửi request nào lên Google cả.
-  if (!apiKey || /^your[_-]?api[_-]?key/i.test(apiKey)) {
-    throw new Error("Chưa có Gemini API Key. Bấm biểu tượng extension English Master AI → tab 'Cài đặt API Key' → dán API Key (lấy MIỄN PHÍ tại aistudio.google.com/app/apikey) → bấm Lưu & Kiểm tra.");
+// Groq chat models trong danh sách free đều là TEXT-ONLY. Nếu sau này thêm model
+// có vision thì khai báo ở đây; mặc định false để không gửi ảnh vào model chữ
+// (Groq trả 400 "content must be a string").
+function groqSupportsImages(model) {
+  return /vision|llava|llama-4-(scout|maverick)/i.test(String(model || ""));
+}
+
+async function groqTranscribe(apiKey, audioObj, whisperModel) {
+  if (!audioObj || !audioObj.base64) return null;
+  try {
+    const bin = atob(audioObj.base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const ext = /wav/i.test(audioObj.mimeType || "") ? "wav" : (/ogg/i.test(audioObj.mimeType || "") ? "ogg" : "mp3");
+    const form = new FormData();
+    form.append("file", new Blob([bytes], { type: audioObj.mimeType || "audio/mp3" }), "audio." + ext);
+    form.append("model", whisperModel || DEFAULT_CONFIG.groqWhisperModel);
+    form.append("response_format", "text");
+    const res = await fetch(GROQ_WHISPER_URL, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + apiKey.trim() },
+      body: form,
+      signal: AbortSignal.timeout(120000)
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      const err = new Error(j.error?.message || ("Whisper HTTP " + res.status));
+      err.status = res.status;
+      throw err;
+    }
+    const txt = await res.text();
+    return String(txt || "").trim() || null;
+  } catch (e) {
+    console.warn("[English Master AI] Groq Whisper lỗi:", e && e.message);
+    return null;
+  }
+}
+
+async function callGroqChat(apiKey, model, systemPrompt, userPrompt, imageBase64) {
+  const messages = [];
+  if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
+  if (imageBase64 && groqSupportsImages(model)) {
+    const imgs = Array.isArray(imageBase64) ? imageBase64 : [imageBase64];
+    const content = [{ type: "text", text: userPrompt }];
+    for (const img of imgs) {
+      if (!img) continue;
+      const clean = img.replace(/^data:image\/[a-z]+;base64,/, "");
+      content.push({ type: "image_url", image_url: { url: "data:image/png;base64," + clean } });
+    }
+    messages.push({ role: "user", content });
+  } else {
+    messages.push({ role: "user", content: userPrompt });
   }
 
+  const res = await fetch(GROQ_CHAT_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + apiKey.trim() },
+    body: JSON.stringify({ model, messages, temperature: 0.1, max_tokens: 8192 }),
+    signal: AbortSignal.timeout(60000)
+  }).catch((e) => {
+    if (e && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      const err = new Error("Hết giờ 60s chờ Groq phản hồi.");
+      err.status = 0;
+      throw err;
+    }
+    throw e;
+  });
+
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(j.error?.message || ("HTTP " + res.status));
+    err.status = res.status;
+    throw err;
+  }
+  const txt = j.choices?.[0]?.message?.content;
+  if (!txt) throw new Error("Groq không trả về kết quả hợp lệ.");
+  return txt;
+}
+
+// Dựng prompt dùng chung cho CẢ hai provider (tách khỏi callGeminiWithFallback để
+// không phải viết lại toàn bộ khối chỉ thị examKind cho Groq).
+function buildFullPrompt(text, taskType, customHint, audioObj, audioList, examKind, transcript) {
   const systemPrompt = PROMPTS[taskType] || PROMPTS.ioe_auto;
   let fullPrompt = systemPrompt;
 
   if (customHint && customHint.trim()) {
     fullPrompt += `\n\n[GỢI Ý / RÀNG BUỘC CỦA NGƯỜI DÙNG]: ${customHint.trim()}`;
   }
-
   if (audioObj) {
     fullPrompt += "\n\n[CHÚ Ý: BÀI THI NGHE AUDIO. Hãy nghe file âm thanh đính kèm kết hợp hình ảnh màn hình!]";
   }
-
-  // examKind-aware multi-audio instruction: a listening exam is NOT always
-  // True/False — fill-word listening exams must return [FILL_WORDS], not
-  // [TF_ANSWERS]. This was the root cause of the "Tái tạo san hô" misclassification.
   if (Array.isArray(audioList) && audioList.length > 0) {
     if (examKind === "fillword") {
       fullPrompt += `\n\n[CHÚ Ý: BÀI THI NGHE ĐIỀN TỪ GỒM ${audioList.length} CÂU. Có ${audioList.length} file audio đính kèm theo đúng thứ tự câu (AUDIO CÂU 1, AUDIO CÂU 2, ...). Hãy nghe TỪNG file, tìm TỪ BỊ CHE (dấu ***) trong câu khẳng định tương ứng và trả về ĐỦ ${audioList.length} kết quả theo định dạng [FILL_WORDS: 1. từ_1, 2. từ_2, ...] — mỗi câu ĐÚNG 1 từ!]`;
+    } else if (examKind === "mcq_multi") {
+      fullPrompt += `\n\n[CHÚ Ý: BÀI THI NGHE TRẮC NGHIỆM GỒM ${audioList.length} CÂU. Có ${audioList.length} file audio đính kèm theo đúng thứ tự câu (AUDIO CÂU 1, AUDIO CÂU 2, ...). Hãy nghe TỪNG file, đối chiếu với câu hỏi + các lựa chọn A/B/C/D của câu tương ứng rồi chọn 1 đáp án đúng. Trả về dòng đầu tiên ĐÚNG định dạng: [MCQ_ANSWERS: 1. B, 2. A, ...] với ĐỦ ${audioList.length} kết quả!]`;
+    } else if (examKind === "listening_tf") {
+      // BUG#47b (live 22/09/2026, chim-hai-tao — Vòng 7 Bài 4): đề NGHE TF dùng
+      // MỘT file audio CHUNG cho cả bài (mọi câu hỏi cùng nghe một đoạn). Khối này
+      // đếm theo SỐ FILE nên với 1 file nó dặn "GỒM 1 CÂU ... trả về ĐỦ 1 kết quả"
+      // — mâu thuẫn trực tiếp với chỉ thị listening_tf bên dưới ("ĐỦ mọi câu"),
+      // model trả 1 đáp án cho bài 5 câu. Số file ≠ số câu ở dạng đề này.
+      if (audioList.length === 1) {
+        fullPrompt += `\n\n[CHÚ Ý: BÀI THI NGHE TRUE/FALSE — MỘT FILE AUDIO DÙNG CHUNG CHO TOÀN BỘ CÁC CÂU. File đính kèm là bài nghe của CẢ BÀI (KHÔNG phải của riêng một câu). Hãy nghe hết file rồi đối chiếu TỪNG câu khẳng định trong đề với nội dung bài nghe.]`;
+      } else {
+        fullPrompt += `\n\n[CHÚ Ý: BÀI THI NGHE TRUE/FALSE GỒM ${audioList.length} CÂU. Có ${audioList.length} file audio đính kèm theo đúng thứ tự câu (AUDIO CÂU 1, AUDIO CÂU 2, ...). Hãy nghe TỪNG file, đối chiếu với câu khẳng định của câu tương ứng và trả về ĐỦ ${audioList.length} kết quả theo định dạng [TF_ANSWERS: 1. True, 2. False, ...]!]`;
+      }
     } else {
       fullPrompt += `\n\n[CHÚ Ý: BÀI THI NGHE TRUE/FALSE GỒM ${audioList.length} CÂU. Có ${audioList.length} file audio đính kèm theo đúng thứ tự câu (AUDIO CÂU 1, AUDIO CÂU 2, ...). Hãy nghe TỪNG file, đối chiếu với câu khẳng định của câu tương ứng và trả về ĐỦ ${audioList.length} kết quả theo định dạng [TF_ANSWERS: 1. True, 2. False, ...]!]`;
     }
+  }
+  // BUG#46: đường Groq không gửi được file audio cho model chữ → audio đã được
+  // Whisper phiên âm TRƯỚC, transcript nhồi thẳng vào prompt kèm chỉ thị rõ ràng.
+  if (transcript) {
+    fullPrompt += `\n\n[BÀI NGHE ĐÃ ĐƯỢC PHIÊN ÂM TỰ ĐỘNG — dùng CHÍNH XÁC bản transcript này làm nội dung bài nghe, KHÔNG suy đoán ngoài nó]:\n"""\n${transcript}\n"""`;
   }
 
   if (examKind === "mcq_multi") {
     fullPrompt += "\n\n[CHÚ Ý: BÀI TRẮC NGHIỆM NHIỀU CÂU. Hãy giải TỪNG câu trong đề và trả về dòng đầu tiên theo định dạng [MCQ_ANSWERS: 1. B, 2. A, ...] với ĐỦ mọi câu!]";
   }
-
-  // Dạng mới (live 17/09/2026, chim-hai-tao — Vòng 1): đọc hiểu True/False
   if (examKind === "reading_tf") {
     fullPrompt += "\n\n[CHÚ Ý: BÀI ĐỌC HIỂU TRUE/FALSE. Đối chiếu TỪNG câu khẳng định với ĐOẠN VĂN đã cung cấp: đúng theo đoạn văn → True, trái hoặc bịa thêm → False. Trả về dòng đầu tiên theo định dạng [TF_ANSWERS: 1. True, 2. False, ...] với ĐỦ mọi câu theo đúng thứ tự!]";
   }
-
-  // Dạng mới (live 17/09/2026, bach-tuoc-thu-ngoc — Vòng 1): sắp xếp từ
+  // BUG#46: đề NGHE True/False. Trước đây chỉ có nhánh reading_tf nên đề nghe rơi
+  // vào prompt ioe_auto chung → AI trả [ANSWER: True] một câu thay vì đủ N câu.
+  if (examKind === "listening_tf") {
+    fullPrompt += "\n\n[CHÚ Ý: BÀI NGHE TRUE/FALSE. Đối chiếu TỪNG câu khẳng định với NỘI DUNG BÀI NGHE (transcript đính kèm nếu có): đúng theo bài nghe → True, trái → False. Trả về dòng đầu tiên theo định dạng [TF_ANSWERS: 1. True, 2. False, ...] với ĐỦ mọi câu theo đúng thứ tự!]";
+  }
   if (examKind === "word_order") {
     fullPrompt += "\n\n[CHÚ Ý: BÀI SẮP XẾP TỪ (word ordering). Sắp xếp các mảnh từ của TỪNG câu thành câu tiếng Anh đúng ngữ pháp, đúng nghĩa. Dùng CHÍNH XÁC từng mảnh từ như đề bài (giữ nguyên chính tả và dấu câu, KHÔNG sửa, KHÔNG thêm từ mới). Trả về dòng đầu tiên theo định dạng [WORD_ORDER: 1. mảnh | mảnh | mảnh, 2. mảnh | mảnh | mảnh, ...] với ĐỦ mọi câu, các mảnh của mỗi câu phân cách bằng dấu | !]";
   }
-
-  // Dạng mới Vòng 6 (16/09/2026): biến đổi câu gõ từ + điền từ đoạn văn
   if (examKind === "transform") {
     fullPrompt += "\n\n[CHÚ Ý: BÀI BIẾN ĐỔI CÂU (sentence transformation). Với MỖI câu, điền các từ còn thiếu vào ô trống [B1], [B2]... của câu thứ hai để nghĩa bằng câu thứ nhất, DÙNG ĐÚNG từ trong kho từ cho trước (mỗi từ đúng 1 lần, có thể có từ gây nhiễu). Trả về dòng đầu tiên theo định dạng [TRANSFORM_WORDS: 1. must | be | careful, 2. to | going, ...] — số thứ tự câu, các từ của câu đó phân cách bằng dấu | !]";
   }
@@ -281,6 +389,79 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
   } else {
     fullPrompt += "\n\nHãy quan sát thật kỹ hình ảnh chụp màn hình bài thi, tự động nhận diện dạng bài (True/False Nghe / Ghép cặp / Trắc nghiệm / Điền từ) và giải chính xác 100%.";
   }
+  return fullPrompt;
+}
+
+// Lưu lịch sử giải (dùng chung cho cả 2 provider).
+async function saveSolveHistory(taskType, audioObj, audioList, text, answer) {
+  try {
+    const historyData = await chrome.storage.local.get({ history: [] });
+    const isAudio = !!(audioObj || (audioList && audioList.length));
+    const newHistory = [
+      {
+        id: Date.now().toString(),
+        timestamp: new Date().toISOString(),
+        taskType: isAudio ? "ioe_listening" : taskType,
+        question: (isAudio ? "[🎧 Bài thi nghe Audio + Hình ảnh]" : (text || "[Ảnh chụp màn hình Game IOE]")).trim(),
+        answer: answer
+      },
+      ...historyData.history.slice(0, 99)
+    ];
+    await chrome.storage.local.set({ history: newHistory });
+  } catch (e) {}
+}
+
+// BUG#46: Groq trước (không tốn quota Gemini), Gemini dự phòng. Ảnh luôn phải
+// qua Gemini vì model chữ của Groq không có vision.
+async function callGroqWithFallback(text, taskType, groqKey, model, imageBase64, audioObj, customHint, audioList, examKind) {
+  let transcript = null;
+  if (audioObj && audioObj.base64) {
+    transcript = await groqTranscribe(groqKey, audioObj, DEFAULT_CONFIG.groqWhisperModel);
+    if (!transcript) throw new Error("Groq Whisper không phiên âm được file nghe.");
+  }
+  // Nhiều file audio (mỗi câu 1 file) → phiên âm từng file, gắn nhãn theo câu.
+  // BUG#47b: đề nghe TF dùng MỘT file chung cho cả bài — gắn nhãn "[AUDIO CÂU 1]"
+  // cho nó sẽ khiến model tưởng file chỉ ứng với câu 1. Nhãn phải nói rõ là bài
+  // nghe của CẢ BÀI.
+  if (Array.isArray(audioList) && audioList.length) {
+    const parts = [];
+    for (const a of audioList) {
+      if (a && a.base64) {
+        const t = await groqTranscribe(groqKey, a, DEFAULT_CONFIG.groqWhisperModel);
+        const label = audioList.length === 1 ? "[BÀI NGHE — DÙNG CHUNG CHO MỌI CÂU]"
+                                             : "[AUDIO CÂU " + (a.qIndex || parts.length + 1) + "]";
+        parts.push(label + ": " + (t || "(không phiên âm được)"));
+      } else {
+        const label = audioList.length === 1 ? "[BÀI NGHE — DÙNG CHUNG CHO MỌI CÂU]"
+                                             : "[AUDIO CÂU " + (a && a.qIndex || parts.length + 1) + "]";
+        parts.push(label + ": (thiếu file audio)");
+      }
+    }
+    transcript = parts.join("\n\n");
+  }
+
+  const fullPrompt = buildFullPrompt(text, taskType, customHint, audioObj, audioList, examKind, transcript);
+  const answer = await callGroqChat(groqKey, model, null, fullPrompt, imageBase64);
+  await saveSolveHistory(taskType, audioObj, audioList, text, answer);
+  return answer;
+}
+
+async function callGeminiWithFallback(text, taskType, customApiKey, customModel, imageBase64 = null, audioObj = null, customHint = "", audioList = null, examKind = null) {
+  const config = await chrome.storage.local.get(DEFAULT_CONFIG);
+  let apiKey = customApiKey || config.geminiApiKey || DEFAULT_CONFIG.geminiApiKey;
+  apiKey = String(apiKey || "").trim();
+  const primaryModel = customModel || config.model || DEFAULT_CONFIG.model;
+
+  // BUG#16: key rỗng hoặc placeholder ("YOUR_API_KEY_HERE" từ bản cũ) → hướng dẫn
+  // nhập key NGAY, không gửi request nào lên Google cả.
+  if (!apiKey || /^your[_-]?api[_-]?key/i.test(apiKey)) {
+    throw new Error("Chưa có Gemini API Key. Bấm biểu tượng extension English Master AI → tab 'Cài đặt API Key' → dán API Key (lấy MIỄN PHÍ tại aistudio.google.com/app/apikey) → bấm Lưu & Kiểm tra.");
+  }
+
+  // BUG#46: khối dựng prompt đã tách thành buildFullPrompt() để Groq và Gemini
+  // dùng CHUNG một bộ chỉ thị examKind — trước đây viết inline ở đây nên khi thêm
+  // provider thứ hai rất dễ lệch nhau (một bên dặn [TF_ANSWERS], bên kia [ANSWER]).
+  const fullPrompt = buildFullPrompt(text, taskType, customHint, audioObj, audioList, examKind, null);
 
   const modelQueue = [primaryModel, ...FALLBACK_MODELS.filter(m => m !== primaryModel)];
 
@@ -290,22 +471,7 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
       console.log(`[English Master AI] Trying model: ${model}...`);
       const answer = await callSingleModel(model, apiKey, fullPrompt, imageBase64, audioObj, audioList);
       console.log(`[English Master AI] Success with model: ${model}`);
-
-      try {
-        const historyData = await chrome.storage.local.get({ history: [] });
-        const newHistory = [
-          {
-            id: Date.now().toString(),
-            timestamp: new Date().toISOString(),
-            taskType: audioObj ? "ioe_listening" : taskType,
-            question: (audioObj ? "[🎧 Bài thi nghe Audio + Hình ảnh]" : (text || "[Ảnh chụp màn hình Game IOE]")).trim(),
-            answer: answer
-          },
-          ...historyData.history.slice(0, 99)
-        ];
-        await chrome.storage.local.set({ history: newHistory });
-      } catch (e) {}
-
+      await saveSolveHistory(taskType, audioObj, audioList, text, answer);
       return answer;
     } catch (err) {
       console.warn(`[English Master AI] Model ${model} failed (${err.message}). Trying fallback...`);
@@ -369,6 +535,59 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
     throw new Error("Hết quota / quá tải toàn bộ " + modelQueue.length + " model AI (429). Chờ 1-2 phút rồi bấm giải lại. Chi tiết: " + lastMsg);
   }
   throw new Error(`Không gọi được AI (đã thử ${modelQueue.length} model): ${lastMsg}`);
+}
+
+// BUG#46: điều phối provider. Groq chỉ dùng được khi KHÔNG có ảnh (model chữ của
+// Groq không có vision) — có ảnh thì Gemini là đường duy nhất, thử Groq chỉ tốn
+// thời gian rồi nhận 400. Không có key Groq → Gemini như cũ (tương thích ngược).
+async function solveWithAi(text, taskType, opts = {}) {
+  const config = await chrome.storage.local.get(DEFAULT_CONFIG);
+  const groqKey = String(opts.groqApiKey || config.groqApiKey || "").trim();
+  const groqModel = opts.groqModel || config.groqModel || DEFAULT_CONFIG.groqModel;
+  const prefer = opts.preferProvider || config.preferProvider || DEFAULT_CONFIG.preferProvider;
+
+  const hasImages = !!(opts.imageBase64 && (Array.isArray(opts.imageBase64) ? opts.imageBase64.length : true));
+  const groqUsable = !!groqKey && !hasImages;
+
+  const callGemini = () => callGeminiWithFallback(
+    text, taskType, opts.apiKey, opts.model,
+    opts.imageBase64 || null, opts.audioObj || null, opts.hint || "",
+    opts.audioList || null, opts.examKind || null
+  );
+  const callGroq = () => callGroqWithFallback(
+    text, taskType, groqKey, groqModel,
+    opts.imageBase64 || null, opts.audioObj || null, opts.hint || "",
+    opts.audioList || null, opts.examKind || null
+  );
+
+  // BUG#46a: khi KHÔNG dùng được Groq (có ảnh / thiếu key) thì dự phòng phải là
+  // null — bản đầu đặt second = callGemini trong mọi nhánh, nên đường có ẢNH gọi
+  // Gemini HAI lần liên tiếp (lần hai chắc chắn fail y hệt, chỉ tốn thời gian và
+  // nhân đôi số request đốt quota). Live-caught bằng unit test.
+  let first, second;
+  if (!groqUsable) {
+    first = callGemini; second = null;
+  } else if (prefer === "gemini") {
+    first = callGemini; second = callGroq;
+  } else {
+    first = callGroq; second = callGemini;
+  }
+
+  try {
+    const r = await first();
+    console.log("[English Master AI] ✅ Giải bằng " + (first === callGroq ? "Groq" : "Gemini"));
+    return r;
+  } catch (e1) {
+    if (!second) throw e1;
+    console.warn("[English Master AI] ⚠️ Provider ưu tiên lỗi (" + (e1 && e1.message) + ") — chuyển provider dự phòng...");
+    try {
+      const r = await second();
+      console.log("[English Master AI] ✅ Giải bằng provider dự phòng");
+      return r;
+    } catch (e2) {
+      throw new Error("Cả 2 provider đều lỗi. Ưu tiên: " + (e1 && e1.message) + " | Dự phòng: " + (e2 && e2.message));
+    }
+  }
 }
 
 // Chrome throttles captureVisibleTab to 2 calls/second. The auto-scroll solver
@@ -468,7 +687,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           });
         }
 
-        const result = await callGeminiWithFallback(request.text || "", "ioe_auto", request.apiKey, request.model, imagePayload, audioObj, request.hint, audioList, request.examKind);
+        const result = await solveWithAi(request.text || "", "ioe_auto", {
+          apiKey: request.apiKey,
+          model: request.model,
+          groqApiKey: request.groqApiKey,
+          groqModel: request.groqModel,
+          preferProvider: request.preferProvider,
+          imageBase64: imagePayload,
+          audioObj,
+          audioList,
+          hint: request.hint,
+          examKind: request.examKind
+        });
         sendResponse({ success: true, data: result, hasAudio: !!(audioObj || (audioList && audioList.length)) });
       } catch (err) {
         sendResponse({ success: false, error: err.message });
@@ -487,13 +717,38 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "SOLVE_QUESTION") {
-    callGeminiWithFallback(request.text, request.taskType, request.apiKey, request.model, request.image, null, request.hint)
+    solveWithAi(request.text, request.taskType, {
+      apiKey: request.apiKey,
+      model: request.model,
+      groqApiKey: request.groqApiKey,
+      groqModel: request.groqModel,
+      preferProvider: request.preferProvider,
+      imageBase64: request.image,
+      hint: request.hint
+    })
       .then(result => sendResponse({ success: true, data: result }))
       .catch(error => sendResponse({ success: false, error: error.message }));
     return true;
   }
 
   if (request.action === "TEST_API_KEY") {
+    // provider: "groq" → chỉ kiểm tra Groq; mặc định kiểm tra Gemini.
+    if (request.provider === "groq") {
+      (async () => {
+        try {
+          const config = await chrome.storage.local.get(DEFAULT_CONFIG);
+          const key = String(request.apiKey || config.groqApiKey || "").trim();
+          if (!key) throw new Error("Chưa có Groq API Key. Lấy MIỄN PHÍ tại console.groq.com/keys");
+          const model = request.model || config.groqModel || DEFAULT_CONFIG.groqModel;
+          const out = await callGroqChat(key, model, null, "Reply with exactly: OK", null);
+          if (!/ok/i.test(String(out))) throw new Error("Groq trả về kết quả bất thường: " + String(out).slice(0, 120));
+          sendResponse({ success: true });
+        } catch (e) {
+          sendResponse({ success: false, error: e.message });
+        }
+      })();
+      return true;
+    }
     callGeminiWithFallback("Hello, test connection.", "translate_analyze", request.apiKey, request.model)
       .then(() => sendResponse({ success: true }))
       .catch(error => sendResponse({ success: false, error: error.message }));

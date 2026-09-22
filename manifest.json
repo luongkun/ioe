@@ -13,6 +13,8 @@
   "host_permissions": [
     "<all_urls>",
     "https://generativelanguage.googleapis.com/*",
+    "https://api.groq.com/*",
+    "https://cdn-s3.vtconline.vn/*",
     "*://*.ioe.vn/*",
     "*://ioe.vn/*"
   ],

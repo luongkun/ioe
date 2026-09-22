@@ -70,6 +70,29 @@
     </div>
 
     <div class="settings-card" style="margin-top: 15px;">
+      <h3>🚀 Groq API Key (MIỄN PHÍ — khuyên dùng để không hết quota)</h3>
+      <p class="settings-desc">
+        Gemini free tier chỉ cho <strong>20 request/phút</strong> nên dễ hết quota giữa bài thi.
+        Groq cho <strong>1000 request/ngày</strong> và <strong>miễn phí, không cần thẻ tín dụng</strong>.
+        Lấy key tại <a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a>
+        → dán vào đây. Để trống cũng được: extension sẽ tự dùng Gemini như trước.
+        <br><em>Lưu ý: Groq dùng để giải đề chữ và nghe audio (Whisper). Đề có ảnh chụp màn hình vẫn phải qua Gemini.</em>
+      </p>
+      <div class="input-with-button">
+        <input type="password" id="opt-groq-key" class="form-input" placeholder="gsk_...">
+        <button id="opt-toggle-groq" class="btn btn-icon">👁️</button>
+      </div>
+      <div class="btn-group-row" style="margin-top: 10px;">
+        <button id="opt-groq-test-btn" class="btn btn-outline btn-sm">⚡ Kiểm Tra Groq</button>
+      </div>
+      <div id="opt-groq-msg" class="info-msg hidden"></div>
+      <label class="switch-row" style="margin-top: 10px;">
+        <span>Ưu tiên Groq (tiết kiệm quota Gemini)</span>
+        <input type="checkbox" id="opt-prefer-groq" checked>
+      </label>
+    </div>
+
+    <div class="settings-card" style="margin-top: 15px;">
       <h3>✨ Trải nghiệm người dùng</h3>
       <label class="switch-row">
         <span>Tự động hiện thanh công cụ nổi khi bôi đen đoạn văn tiếng Anh</span>
