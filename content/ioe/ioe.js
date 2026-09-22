@@ -321,11 +321,24 @@
     return lines.join("\n");
   }
 
-  function buildMcqMultiPrompt(qs, indices, st) {
+  // BUG#36 (live 22/09/2026, an-khe-tra-vang — "Bài thi số 2", lớp 11 Vòng 3):
+  // dạng ĐỌC HIỂU trắc nghiệm. API trả `tans: []` cho MỌI câu (khác hẳn các
+  // game MCQ trước) → buộc phải để AI suy luận. Nhưng đề bài nằm ở ĐOẠN VĂN
+  // trong game (node conv_content_scroll / controller desStrContent), KHÔNG có
+  // trong prompt của API — prompt chỉ là câu hỏi ("What is the passage mainly
+  // about?"). Prompt cũ chỉ gửi câu hỏi + 4 lựa chọn ⇒ AI mù ngữ cảnh, đoán bừa.
+  // Passage lấy từ READ_GAME_SCREEN.first (ghép RICHTEXT_CHILD) truyền vào đây.
+  function buildMcqMultiPrompt(qs, indices, st, passage) {
     const lines = [];
     lines.push("ĐỀ THI TRẮC NGHIỆM NHIỀU CÂU — đọc trực tiếp từ API GAME IOE (chính xác 100%, không cần OCR):");
     if (st && st.gameDesc) lines.push("Hướng dẫn game: " + st.gameDesc);
     lines.push("");
+    const p = String(passage || "").trim();
+    if (p) {
+      lines.push("ĐOẠN VĂN (passage — đọc kỹ rồi mới trả lời các câu hỏi bên dưới):");
+      lines.push(p);
+      lines.push("");
+    }
     lines.push(`Tổng số câu: ${indices.length}`);
     lines.push("");
     indices.forEach((qi, k) => {
@@ -334,7 +347,7 @@
       (q.answers || []).forEach((a, ai) => lines.push(`  ${String.fromCharCode(65 + ai)}. ${a}`));
     });
     lines.push("");
-    lines.push(`YÊU CẦU: Giải TỪNG câu, chọn 1 lựa chọn đúng. Dòng đầu tiên ĐÚNG định dạng: [MCQ_ANSWERS: 1. B, 2. A, ...] với ĐỦ ${indices.length} kết quả.`);
+    lines.push(`YÊU CẦU: Giải TỪNG câu, chọn 1 lựa chọn đúng.${p ? " Dựa CHẶT vào đoạn văn ở trên — câu trả lời phải khớp với điều đoạn văn thực sự nói, không suy diễn ngoài đoạn văn." : ""} Dòng đầu tiên ĐÚNG định dạng: [MCQ_ANSWERS: 1. B, 2. A, ...] với ĐỦ ${indices.length} kết quả.`);
     return lines.join("\n");
   }
 
@@ -812,7 +825,21 @@
 
     if (unknownIdx.length) {
       showToast(`🎯 Trắc nghiệm ${qs.length} câu: AI đang giải ${unknownIdx.length} câu còn lại...`);
-      const resp = await askAiForGame(buildMcqMultiPrompt(qs, unknownIdx, st), { examKind: "mcq_multi" });
+      // BUG#36: lấy ĐOẠN VĂN từ màn hình game trước khi hỏi AI. Dạng đọc hiểu
+      // (an-khe-tra-vang) không có passage trong API — thiếu nó AI chỉ thấy câu
+      // hỏi trống ngữ cảnh. READ_GAME_SCREEN.first ghép RICHTEXT_CHILD của
+      // conv_content_scroll nên đọc được trọn đoạn (live: 1226 ký tự).
+      let passage = "";
+      try {
+        const scr = await ioeBridgeRequest("READ_GAME_SCREEN", {}, 6000);
+        const p0 = (scr && scr.payload) || {};
+        const cand = String(p0.first || "").trim();
+        // Chỉ nhận khi thật sự là đoạn văn: dài và có nhiều câu.
+        if (cand.length >= 200 && (cand.match(/[.?!]/g) || []).length >= 3) passage = cand;
+      } catch (e) {}
+      if (passage) console.log("[English Master AI] 📖 Đã lấy đoạn văn từ game (" + passage.length + " ký tự) cho đề đọc hiểu.");
+      else console.warn("[English Master AI] ⚠️ Không đọc được đoạn văn từ game — AI sẽ giải không có ngữ cảnh.");
+      const resp = await askAiForGame(buildMcqMultiPrompt(qs, unknownIdx, st, passage), { examKind: "mcq_multi" });
       // BUG#17: AI fail → KHÔNG render bảng "?" — báo lỗi thật trong panel, thoát sớm
       if (!resp || !resp.success) {
         const known = picks.filter(Boolean).length;
