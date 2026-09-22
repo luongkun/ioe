@@ -834,7 +834,11 @@
       let resp = null;
       if (optText) resp = await ioeBridgeRequest("CLICK_TEXT", { text: optText, contains: true }, 8000);
       if (!resp || !resp.payload || !resp.payload.ok) {
-        for (const nm of ["btn" + letter, "btn_" + letter.toLowerCase(), "ans" + letter, "choice" + letter,
+        for (const nm of ["btn" + letter, "btn" + letter.toLowerCase(), "btn_" + letter.toLowerCase(),
+          "ans" + letter, "ans" + letter.toLowerCase(), "choice" + letter, "choice" + letter.toLowerCase(),
+          // an-khe-tra-vang (BUG#32): nút D tên `btnd` (d thường) còn A/B/C là
+          // btnA/btnB/btnC — CLICK_NAME giờ khớp không phân biệt hoa/thường nên
+          // "btnD" trúng `btnd`; giữ thêm biến thể viết thường cho chắc.
           // thanh-pho-xanh (Vòng 6): options là node khung_tracnghiem* — A→(không
           // hậu tố), B→-001, C→-002, D→-003 (live-verified thứ tự này)
           "khung_tracnghiem" + (li === 0 ? "" : "-" + String(li).padStart(3, "0"))]) {

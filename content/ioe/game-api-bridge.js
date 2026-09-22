@@ -334,28 +334,76 @@
     try { node.emit("click"); return true; } catch (e) { return false; }
   }
 
+  // Strip Cocos RichText markup: "<color=#000000>The achievements of vaccines.</color>"
+  // → "The achievements of vaccines." (BUG#32: option text lives in RichText, so
+  // the raw markup never matched the answer text from the game API).
+  function stripRichText(s) {
+    return String(s || "")
+      .replace(/<[^>]*>/g, "")   // <color=...>, </color>, <b>, <br> ...
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function labelOf(node) {
     const cc = getCC();
+    if (!node || !node.getComponent) return null;
+    // 1. cc.Label (the common case)
     try {
-      const l = cc.Label && node.getComponent ? node.getComponent(cc.Label) : null;
+      const l = cc.Label && node.getComponent(cc.Label);
       if (l && typeof l.string === "string" && l.string.trim()) return l.string.replace(/\s+/g, " ").trim();
+    } catch (e) {}
+    // 2. cc.RichText / RichText — markup must be stripped before comparison
+    try {
+      const names = ["RichText", "LabelOutline", "LabelShadow"];
+      for (const nm of names) {
+        const Cls = cc[nm];
+        if (!Cls) continue;
+        const c = node.getComponent(Cls);
+        const raw = c && (typeof c.string === "string" ? c.string : (typeof c.text === "string" ? c.text : ""));
+        if (raw && String(raw).trim()) {
+          const plain = stripRichText(raw);
+          if (plain) return plain;
+        }
+      }
+    } catch (e) {}
+    // 3. Any component exposing a non-empty `string`/`text` (custom renderers)
+    try {
+      for (const c of (node._components || [])) {
+        if (!c) continue;
+        const raw = (typeof c.string === "string" && c.string) || (typeof c.text === "string" && c.text) || "";
+        if (raw && String(raw).trim()) {
+          const plain = stripRichText(raw);
+          if (plain) return plain;
+        }
+      }
     } catch (e) {}
     return null;
   }
 
-  // Return the displayed text of a node: own Label or first descendant Label
-  function nodeText(node) {
+  // Return the displayed text of a node: own label, else the first descendant
+  // that carries text — searched to ANY depth (BUG#32: the answer text sits in
+  // aScrollView/<scroll content>/<RichText>, i.e. deeper than the old 2 levels).
+  function nodeText(node, maxDepth) {
+    if (!node) return null;
+    const limit = typeof maxDepth === "number" ? maxDepth : 6;
     const own = labelOf(node);
     if (own) return own;
-    for (const c of (node.children || [])) {
-      const t = labelOf(c);
-      if (t) return t;
-      for (const g of (c.children || [])) {
-        const t2 = labelOf(g);
-        if (t2) return t2;
+    let best = null;
+    const walk = (n, depth) => {
+      if (!n || depth > limit || best) return;
+      for (const c of (n.children || [])) {
+        const t = labelOf(c);
+        if (t) { best = t; return; }
+        walk(c, depth + 1);
+        if (best) return;
       }
-    }
-    return null;
+    };
+    walk(node, 1);
+    return best;
   }
 
   function allNodes() {
@@ -373,9 +421,27 @@
     return out;
   }
 
+  // BUG#32 (an-khe-tra-vang, 22/09/2026): nhieu game khai bao nut bang COMPONENT
+  // TU DINH NGHIA (vd `AnswerButton`) chu khong dung cc.Button — isButton() cu
+  // tra false nen findNodeByText bo qua toan bo dap an. Nhan them component co
+  // ten/hanh vi giong nut.
+  const CUSTOM_BTN_RE = /(button|btn|toggle|clickable|pressable)/i;
   function isButton(node) {
     const cc = getCC();
-    try { return !!(cc.Button && node.getComponent && node.getComponent(cc.Button)); } catch (e) { return false; }
+    try {
+      if (cc.Button && node.getComponent && node.getComponent(cc.Button)) return true;
+    } catch (e) {}
+    // Custom component whose class name looks like a button. Doc TEN CLASS tu
+    // constructor (khong dung `__classname__` — minified co the la "CCClass").
+    try {
+      const comps = node._components || [];
+      for (const c of comps) {
+        if (!c) continue;
+        const n = (c.constructor && c.constructor.name) || c.__classname__ || "";
+        if (CUSTOM_BTN_RE.test(n)) return true;
+      }
+    } catch (e) {}
+    return false;
   }
 
   function normText(s) {
@@ -421,6 +487,86 @@
     if (!name) return null;
     for (const n of allNodes()) {
       if (n && n.activeInHierarchy !== false && n.name === name) return n;
+    }
+    return null;
+  }
+
+  // Case-insensitive name lookup (BUG#32: the same game names its option buttons
+  // btnA/btnB/btnC but `btnd` — lowercase d — so an exact-match ladder misses D).
+  function findNodeByNameCI(name) {
+    if (!name) return null;
+    const want = String(name).toLowerCase();
+    for (const n of allNodes()) {
+      if (n && n.activeInHierarchy !== false && String(n.name).toLowerCase() === want) return n;
+    }
+    return null;
+  }
+
+  // BUG#32 (an-khe-tra-vang, Cocos 2.0.0 alpha): in some games the option TEXT and
+  // the CLICKABLE button are SIBLINGS inside one card, not ancestor/descendant:
+  //
+  //   answer_a/                    <- card (cc.Sprite + AnswerButton? no, plain)
+  //     aScrollView/
+  //       a_content_no_scroll-001  <- RichText "The reasons why…"   (the TEXT)
+  //       btnA                     <- cc.Sprite + AnswerButton, NO label  (the CLICK)
+  //     icon_A/
+  //
+  // So findNodeByText found the RichText node but that node is NOT clickable, and
+  // nodeText(btnA) was null so the button never matched. Resolve by walking UP
+  // from the text node to the card, then searching the card subtree for a
+  // clickable node and returning THAT.
+  function resolveClickableInCard(textNode) {
+    if (!textNode) return null;
+    let card = textNode;
+    for (let up = 0; up < 3 && card; up++) {
+      // Prefer a clickable node inside the card, closest to the card root.
+      const found = findClickableInSubtree(card, 4);
+      if (found) return found;
+      card = card.parent;
+    }
+    return null;
+  }
+
+  function findClickableInSubtree(root, maxDepth) {
+    if (!root) return null;
+    const queue = [{ n: root, d: 0 }];
+    while (queue.length) {
+      const { n, d } = queue.shift();
+      if (!n) continue;
+      if (isButton(n) && n !== root && n.activeInHierarchy !== false) return n;
+      if (d >= maxDepth) continue;
+      for (const c of (n.children || [])) queue.push({ n: c, d: d + 1 });
+    }
+    return null;
+  }
+
+  // Resolve answer text → the node to CLICK, handling both layouts:
+  //   (a) text is inside the clickable node (classic)  → return that node
+  //   (b) text and button are siblings in a card       → return the sibling button
+  function findClickTargetByText(text, opts) {
+    const contains = !!(opts && opts.contains);
+    const target = normText(text);
+    if (!target) return null;
+    const cands = allNodes().filter(n => n && n.activeInHierarchy !== false);
+
+    // (a) classic: a clickable node whose own/descendant text matches
+    const direct = findNodeByText(text, opts);
+    if (direct) {
+      if (isButton(direct)) return direct;
+      // the text node itself is not clickable → try its card's button
+      const sib = resolveClickableInCard(direct);
+      if (sib) return sib;
+      return direct; // fall back to clicking the text position (still a valid point)
+    }
+    // (b) sibling layout: find the text node, then the button in the same card
+    for (const n of cands) {
+      if (isButton(n)) continue; // buttons rarely carry the text in this layout
+      const t = normText(nodeText(n));
+      if (!t) continue;
+      const hit = contains ? (target.length >= 3 && (t.includes(target) || target.includes(t))) : (t === target);
+      if (!hit) continue;
+      const btn = resolveClickableInCard(n);
+      if (btn) return btn;
     }
     return null;
   }
@@ -1003,6 +1149,10 @@
     if (!name) return { ok: false, reason: "no_name" };
     let n = findNodeByName(name);
     let via = "exact";
+    // BUG#32: try a case-insensitive exact match before fuzzy prefix/contains —
+    // `btnd` (lowercase) never matched the solver's "btnD" and the fuzzy passes
+    // could latch onto an unrelated node.
+    if (!n) { n = findNodeByNameCI(name); if (n) via = "ci_exact"; }
     if (!n) {
       for (const x of allNodes()) {
         if (x && x.activeInHierarchy !== false && typeof x.name === "string" && x.name.startsWith(name + " ")) { n = x; via = "prefix"; break; }
@@ -1360,7 +1510,7 @@
           reply(reqId, "START_GAME_OK", await startGame());
           break;
         case "CLICK_TEXT":
-          reply(reqId, "CLICK_TEXT_OK", { ok: clickNode(findNodeByText((d.data || {}).text, { contains: !!(d.data || {}).contains })) });
+          reply(reqId, "CLICK_TEXT_OK", { ok: clickNode(findClickTargetByText((d.data || {}).text, { contains: !!(d.data || {}).contains })) });
           break;
         case "CLICK_NAME":
           reply(reqId, "CLICK_NAME_OK", clickNameSmart((d.data || {}).name));
@@ -1425,8 +1575,11 @@
     scanLabels: scanLabels,
     listNodes: listNodes,
     startGame: startGame,
-    clickText: (t) => clickNode(findNodeByText(t, { contains: true })),
+    clickText: (t) => clickNode(findClickTargetByText(t, { contains: true })),
     clickName: (n) => clickNode(findNodeByName(n)),
+    // BUG#32 diagnostics: resolve (without clicking) which node an option text
+    // would hit — lets the solver/tests prove the mapping before mutating state.
+    resolveText: (t) => { const n = findClickTargetByText(t, { contains: true }); return n ? { name: n.name, text: nodeText(n, 3), isButton: isButton(n) } : null; },
     typeIntoEditBox: typeIntoEditBox,
     confirmAnswer: confirmAnswer,
     dismissSystemPopups: dismissSystemPopups,

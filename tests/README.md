@@ -6,12 +6,19 @@ Hạ tầng test E2E cho extension trên Chromium thật (không headless-new v�
 
 | File | Mục đích |
 |------|----------|
+| `test_bug32_option_nodes.js` | **Chạy được bằng `node` thuần, KHÔNG cần Playwright/Xvfb/mạng.** Nạp thẳng các hàm thật từ `game-api-bridge.js` rồi chạy trên cây Cocos giả lập đúng cấu trúc live của `an-khe-tra-vang` (BUG#32: text đáp án và nút bấm là ANH EM, `AnswerButton` tuỳ biến, nút D tên `btnd` chữ thường). 13 assert. |
 | `test_extension.js` | Suite 12 test trên trang giả lập (pill inject, bridge inject, anti-copy, MCQ solve+autoclick, F2, fill, reorder, mixed, pageerror) |
 | `test_fillword.js` | Suite 11 test E2E dạng **nghe điền từ** (EditBox Cocos) + **trắc nghiệm nhiều câu** + cache câu hỏi + chip click không ReferenceError |
 | `test_ai_key_failure.js` | Suite 14 test E2E **đường AI Gemini THẬT khi key chưa nhập / sai / placeholder** (BUG#16/#17): không gán nhãn "quá tải" cho key sai, không render bảng "1.? 2.? 3.?", có hướng dẫn lấy key, thoát nhanh. Cần bản extension `ioe-bugtest` (copy ioe-test rồi `MOCK_GEMINI = false`) — chạy `node tests/test_ai_key_failure.js before|after` |
 | `debug_fillword_e2e.js` | Debug 1 trang fillword: dump console, bridge state, panel chips, game state — dùng khi cần soi pipeline từng bước |
 | `mock-pages/` | Trang giả lập IOE + runtime Cocos giả (`mock_cocos_runtime.js`) — phục vụ từ file server test |
 | `mock_gemmai_snippet.js` | Block `MOCK_GEMINI` chèn vào service worker bản test — mô phỏng Gemini trả đáp án theo từ khoá prompt, không cần API key |
+
+## Test chạy ngay (không cần cài gì)
+
+```bash
+node tests/test_bug32_option_nodes.js   # 13/13 PASS — logic tra node đáp án
+```
 
 ## Tái lập môi trường test (từ repo trống)
 
