@@ -206,8 +206,20 @@
     //   được nhánh pipeBank bên dưới → solver đi gõ từng câu thay vì chọn chip.
     //   Tín hiệu phân biệt không thể nhầm: prompt của cloze CHỈ gồm các từ nối bằng
     //   "|" ("happen|opened|ambition|Success|nearly|so"), còn prompt của transform
-    //   là một CÂU tiếng Anh trọn vẹn. Vì vậy xét pipeBank TRƯỚC transform.
-    const pipeBank = qs.length === 1 && /^\s*[\w'-]+(\|[\w'-]+)+\s*$/.test(String(qs[0].prompt || ""));
+    //   là một CÂU tiếng Anh trọn vẹn (không có "|" nào). Vì vậy xét pipeBank
+    //   TRƯỚC transform.
+    //   BUG#54 (live 23/09/2026, cuon-giay-bi-an — Vòng 6 Bài 2): regex cũ đòi
+    //   MỖI mục trong kho từ là MỘT từ đơn (`[\w'-]+`) — nhưng IOE trả kho từ gồm
+    //   cả CỤM nhiều từ: "follow in their footsteps|common characteristics|
+    //   experiences|...". Regex cũ trượt ⇒ rơi xuống nhánh transform (type 3,
+    //   format 21) ⇒ solver đi GÕ từng câu vào EditBox (màn hình không có EditBox
+    //   nào) ⇒ bài đứng im 0 điểm dù AI trả lời đúng. Đã cứu được lượt đó bằng
+    //   cách gọi thẳng bridge (100/100), nhưng phải sửa gốc.
+    //   Sửa: cho phép KHOẢNG TRẮNG trong mỗi mục (cụm từ), vẫn bắt buộc có "|".
+    //   Dấu nháy cong U+2019 ("children’s") cũng phải nằm trong lớp ký tự.
+    const p0 = String(qs[0].prompt || "");
+    const ITEM = "[\\w'\\u2019-]+(?:[ \\t]+[\\w'\\u2019-]+)*";
+    const pipeBank = qs.length === 1 && new RegExp("^\\s*" + ITEM + "(?:\\s*\\|\\s*" + ITEM + ")+\\s*$").test(p0);
     if (pipeBank) return "cloze_chip";
 
     const t3Count = qs.filter(q => q.type === 3).length;
@@ -289,8 +301,16 @@
   // "[FILL_WORDS: 1. supposed, 2. meets]" / "[MCQ_ANSWERS: 1. B, 2. A]" → array theo số thứ tự
   function parseTagItems(inner) {
     const s = String(inner || "");
+    // BUG#53 (live 23/09/2026, don-rac-bai-bien — Vòng 4 Bài 1): ngưỡng cũ
+    // `numbered.length >= 2` khiến MỘT mục bị đẩy xuống nhánh fallback, mà
+    // fallback chỉ tách theo [,;\n] nên "1. D" KHÔNG hề bị cắt số thứ tự ⇒
+    // items[0] = "1. D" ⇒ /^([A-D])/ không khớp ⇒ mọi câu "AI không trả lời
+    // được". Chế độ đọc hiểu TỪNG CÂU (BUG#52) LUÔN hỏi AI đúng một câu một
+    // lượt nên nó dính 100% số lần — 10/10 câu đều fail dù AI trả lời đúng.
+    // Đường gộp nhiều câu không lộ lỗi này vì luôn có ≥2 mục.
+    // Số thứ tự là dấu hiệu định dạng, không phụ thuộc số lượng mục.
     const numbered = s.match(/(\d+)\s*[.):\-\s]+[^,;]+/g);
-    if (numbered && numbered.length >= 2) {
+    if (numbered && numbered.length >= 1) {
       const out = [];
       for (const tok of numbered) {
         const m = tok.match(/(\d+)\s*[.):\-\s]+(.+)/);
@@ -308,6 +328,19 @@
         chrome.runtime.sendMessage({
           action: "SOLVE_CURRENT_SCREEN",
           images: null,
+          // BUG#51 (live 23/09/2026, tai-tao-san-ho — Vòng 3 Bài 1): đường
+          // game-API KHÔNG BAO GIỜ cần ảnh — mọi thứ đã đọc chính xác 100% từ
+          // API game. Nhưng `images: null` một mình KHÔNG nói được điều đó:
+          // service worker hiểu null là "content script chưa chụp, để tôi chụp
+          // bù" → captureVisibleTab → imageBase64 có giá trị → hasImages=true →
+          // Groq (model chữ, không vision) bị loại khỏi chuỗi provider → bài rơi
+          // vào Gemini 429 dù Groq còn nguyên quota. Live-caught: solver phân
+          // loại đúng "mcq_multi", gọi AI, rồi KHÔNG click câu nào và trả về
+          // undefined; HUD đứng ở câu 1 / 0 điểm; console chỉ có "Không đọc được
+          // đoạn văn". Cùng một prompt, bật cờ này: Groq trả lời trong ~1s.
+          // Cờ này là thứ BUG#50 đã thêm cho đường chụp-ảnh; đường game-API quên
+          // truyền nên phải sửa ở đây.
+          skipScreenshot: true,
           text: "\n\n" + promptText,
           audioUrl: null,
           audioBase64: null,
@@ -366,6 +399,23 @@
     if ((t.match(/[.?!]/g) || []).length < 3) return false;
     if ((t.match(/\s+/g) || []).length < 30) return false;
     return true;
+  }
+
+  // Chuẩn hoá văn bản để so "đoạn văn này có phải chính hướng dẫn game không".
+  // Trước đây là biến cục bộ trong solveReadingTfExam; BUG#52 cần dùng lại ở
+  // solveAndClickMcqMulti nên tách ra đây (một định nghĩa, không chép đôi).
+  function gdNorm(s) {
+    return String(s || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  }
+
+  // Đoạn văn đọc được có phải CHÍNH hướng dẫn game (gameDesc) không? BUG#41 đã
+  // gặp: màn hướng dẫn trả về gameDesc dài 188-355 ký tự, đủ nhiều câu nên
+  // looksLikePassage() cho qua ⇒ AI nhận hướng dẫn làm "đoạn văn".
+  function passageIsGameDesc(cand, gameDesc) {
+    const np = gdNorm(cand), ng = gdNorm(gameDesc);
+    if (!np || !ng) return false;
+    const head = np.slice(0, 90);
+    return !!head && (ng.includes(head) || head.includes(ng.slice(0, 90)));
   }
 
   function buildMcqMultiPrompt(qs, indices, st, passage) {
@@ -629,7 +679,6 @@
     // live: 670 ký tự) — KHÔNG dùng readGameScreen().first vì hàm đó gom mọi
     // RICHTEXT_CHILD của cả đoạn văn lẫn câu hỏi → hai khối đan xen thành rác.
     // BUG#43: thử lại vài lần — đoạn văn chỉ có sau khi scene StartScene đóng.
-    const gdNorm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
     let passage = "";
     for (let attempt = 0; attempt < 10 && !passage; attempt++) {
       try {
@@ -638,15 +687,9 @@
         // BUG#43: loại đoạn văn CHÍNH LÀ hướng dẫn game (cùng cách BUG#41 đã làm
         // cho mcq_multi) — nếu không, "đoạn văn" là gameDesc và AI bị lệnh
         // "chỉ dựa vào đoạn văn" trong khi đoạn văn thật chưa hiện.
-        const np = gdNorm(cand), ng = gdNorm(st && st.gameDesc);
-        const head = np.slice(0, 90);
-        if (head && ng && (ng.includes(head) || head.includes(ng.slice(0, 90)))) {
-          console.warn("[English Master AI] ⚠️ 'Đoạn văn' đọc được CHÍNH LÀ hướng dẫn game — chờ đoạn văn thật...");
-        } else if (looksLikePassage(cand)) {
-          passage = cand;
-        }
+        if (!passageIsGameDesc(cand, st && st.gameDesc) && looksLikePassage(cand)) passage = cand;
       } catch (e) {}
-      if (!passage) await sleep(1200);
+      if (!passage) await sleep(900);
     }
     if (!passage) {
       const infoResp = await ioeBridgeRequest("CURRENT_QUESTION", {}, 6000);
@@ -821,10 +864,7 @@
           try {
             const pResp = await ioeBridgeRequest("GET_PASSAGE", {}, 6000);
             const cand = String((pResp && pResp.payload && pResp.payload.passage) || "").trim();
-            const np = gdNorm(cand), ng = gdNorm(st && st.gameDesc);
-            const head = np.slice(0, 90);
-            const isInstr = head && ng && (ng.includes(head) || head.includes(ng.slice(0, 90)));
-            if (!isInstr && looksLikePassage(cand, 120)) pass = cand;
+            if (!passageIsGameDesc(cand, st && st.gameDesc) && looksLikePassage(cand, 120)) pass = cand;
           } catch (e) {}
           if (!pass) await sleep(900);
         }
@@ -1071,8 +1111,40 @@
       else unknownIdx.push(i);
     });
 
+    // BUG#52b: `passage` và `convMode` phải sống NGOÀI khối `if (unknownIdx.length)`
+    // bên dưới — vòng lặp click từng câu (cuối hàm) đọc cả hai. Khai báo trong
+    // khối đó rồi dùng ở ngoài ⇒ "passage is not defined" (live 23/09/2026,
+    // don-rac-bai-bien, ngay sau khi bấm Làm bài).
+    let passage = "";
+    let convMode = false;
+
     if (unknownIdx.length) {
       showToast(`🎯 Trắc nghiệm ${qs.length} câu: AI đang giải ${unknownIdx.length} câu còn lại...`);
+      // BUG#52 (live 23/09/2026, don-rac-bai-bien — Vòng 4 Bài 1): game này đọc
+      // hiểu TỪNG CÂU MỘT, MỖI CÂU CÓ ĐOẠN VĂN RIÊNG. Bản cũ đọc MỘT đoạn văn
+      // (của câu 1) rồi hỏi AI cả 10 câu trong một lượt ⇒ 9 câu sau bị trả lời
+      // dựa trên đoạn văn của câu 1. Live: 10/100 (chỉ câu 1 đúng, vì chỉ câu 1
+      // khớp đoạn văn đã đọc), game kết thúc ngay. Trong khi an-khe-tra-vang
+      // (Vòng 3 Bài 2, 100/100) là game CHỌN CẶP TỪ ĐỒNG NGHĨA — không có đoạn
+      // văn nào cả, một lượt AI là đúng.
+      //
+      // Phân biệt hai chế độ bằng node câu hỏi ĐANG HIỆN, không bằng tên game
+      // (tên game là dữ liệu, không phải giao kèo):
+      //   • nConversationQuest  = đọc hiểu từng câu, đoạn văn đổi mỗi câu
+      //   • nTracNghiem         = trắc nghiệm thường / chọn cặp, một lượt AI
+      // Cách này khớp với những gì đã kiểm chứng live:
+      //   don-rac-bai-bien → active nConversationQuest, passage câu1 "Generation
+      //     Y…" → câu2 "Fred Lorz…" (đổi thật), 0 ô btn_quest_item
+      //   an-khe-tra-vang  → 5 ô btn_quest_item, đổi câu bằng tay, không có
+      //     đoạn văn nào (prompt toàn từ đơn: sorrow/polite/relatively…)
+      convMode = false;
+      try {
+        const modeResp = await ioeBridgeRequest("ACTIVE_QUESTION_MODE", {}, 6000);
+        convMode = !!(modeResp && modeResp.payload && modeResp.payload.conversation);
+      } catch (e) {}
+      if (convMode) {
+        console.log("[English Master AI] 📖 Game đọc hiểu TỪNG CÂU (nConversationQuest) — mỗi câu một đoạn văn riêng, giải lần lượt.");
+      }
       // BUG#38 (live 22/09/2026): dùng GET_PASSAGE (node conv_content_scroll) —
       // đoạn văn SẠCH. Bản cũ dùng READ_GAME_SCREEN.first: hàm đó gom MỌI
       // RICHTEXT_CHILD của cả đoạn văn LẪN câu hỏi rồi sắp theo toạ độ y nên
@@ -1083,7 +1155,7 @@
       // (live: 41 ký tự "Mai and Lan have been friends ... school.") ⇒ bị nhận
       // nhầm làm đoạn văn rồi nhồi vào prompt. Dùng looksLikePassage() (khai
       // báo ở trên, kiểm tra NỘI DUNG: đủ dài + nhiều câu + nhiều từ).
-      let passage = "";
+      passage = "";
       try {
         const pResp = await ioeBridgeRequest("GET_PASSAGE", {}, 6000);
         const cand = String((pResp && pResp.payload && pResp.payload.passage) || "").trim();
@@ -1121,6 +1193,11 @@
       if (audioUrls && audioUrls.length) {
         console.log("[English Master AI] 🎧 Đề nghe-trắc-nghiệm: gửi " + audioUrls.length + " file audio cho AI.");
       }
+      // BUG#52: ở chế độ đọc hiểu TỪNG CÂU, KHÔNG hỏi AI cả loạt ở đây — đoạn
+      // văn chỉ đúng cho câu 1, 9 câu còn lại sẽ bị trả lời dựa trên đoạn văn
+      // sai (live: 10/100). Đáp án của từng câu được lấy trong vòng lặp bên
+      // dưới, ngay trước khi click, khi đoạn văn của câu đó đã hiện trên màn.
+      if (!convMode) {
       if (passage) console.log("[English Master AI] 📖 Đã lấy đoạn văn từ game (" + passage.length + " ký tự) cho đề đọc hiểu.");
       else console.warn("[English Master AI] ⚠️ Không đọc được đoạn văn từ game — AI sẽ giải không có ngữ cảnh.");
       const resp = await askAiForGame(buildMcqMultiPrompt(qs, unknownIdx, st, passage), { examKind: "mcq_multi", audioUrls });
@@ -1151,6 +1228,7 @@
           return false;
         }
       }
+      }
     } else {
       showToast(`⚡ Đã nhớ sẵn đáp án cả ${qs.length} câu trắc nghiệm — làm ngay!`);
     }
@@ -1175,7 +1253,55 @@
     }
 
     const total = qs.length;
+    // BUG#52: đoạn văn của câu đã trả lời gần nhất — dùng để phát hiện scene đã
+    // dựng xong đoạn văn MỚI hay chưa. Khởi tạo bằng đoạn văn của câu 1 (đã đọc
+    // ở trên) để câu 2 không bị coi là "chưa đổi" rồi hỏi AI với đoạn văn cũ.
+    let lastPassage = passage;
     const done = await runPerQuestionActions(total, async (i) => {
+      // BUG#52: chế độ đọc hiểu từng câu — lấy đáp án NGAY BÂY GIỜ, khi đoạn văn
+      // của câu i đang hiện trên màn. Không dùng picks[] từ lượt AI chung vì lượt
+      // đó đã bị bỏ qua (convMode).
+      if (convMode) {
+        // Chờ scene dựng lại đoạn văn của câu này. BUG#44b đã gặp đúng cái bẫy
+        // này ở đường reading_tf: đọc ngay sau khi click sẽ dính passage RỖNG
+        // hoặc passage CŨ. Thử tối đa 10 lần, mỗi lần 900ms.
+        let pass = "";
+        for (let attempt = 0; attempt < 10; attempt++) {
+          try {
+            const pResp = await ioeBridgeRequest("GET_PASSAGE", {}, 6000);
+            const cand = String((pResp && pResp.payload && pResp.payload.passage) || "").trim();
+            // Câu 0: đoạn văn đã có sẵn. Câu i>0: phải là đoạn văn KHÁC câu trước.
+            if (!passageIsGameDesc(cand, st && st.gameDesc) && looksLikePassage(cand, 120) && (i === 0 || cand !== lastPassage)) { pass = cand; break; }
+          } catch (e) {}
+          await sleep(900);
+        }
+        if (pass) lastPassage = pass;
+        else console.warn("[English Master AI] ⚠️ Câu " + (i + 1) + ": không đọc được đoạn văn riêng — hỏi AI không có ngữ cảnh.");
+        let ans = null;
+        for (let aiTry = 0; aiTry < 3 && !ans; aiTry++) {
+          const r = await askAiForGame(buildMcqMultiPrompt([qs[i]], [0], st, pass), { examKind: "mcq_multi", audioUrls: null });
+          if (r && r.success) {
+            const tag = String(r.data || "").match(/\[MCQ_ANSWERS:\s*([^\]]+)\]/i);
+            if (tag) {
+              const items = parseTagItems(tag[1]);
+              const v = items[0] != null ? String(items[0]).trim().toUpperCase() : "";
+              const m = v.match(/^([A-D])/);
+              if (m) ans = m[1];
+            }
+          }
+          if (!ans) {
+            console.warn("[English Master AI] ⚠️ Câu " + (i + 1) + " lượt AI " + (aiTry + 1) + "/3 không dùng được.");
+            await sleep(1200);
+          }
+        }
+        if (!ans) {
+          console.error("[English Master AI] ❌ Câu " + (i + 1) + ": AI không trả lời được sau 3 lượt.");
+          showToast(`⚠️ Câu ${i + 1}: AI không trả lời được — bỏ qua`);
+          return false;
+        }
+        picks[i] = ans;
+        saveQCacheEntry(qCacheKeyFor(qs[i], pool), ans);
+      }
       const letter = picks[i];
       if (!letter) return false;
       const q = qs[i];
@@ -1777,7 +1903,7 @@
     ioeRootEl.innerHTML = `
       <div class="ioe-control-pill" id="ioe-pill-toggle">
         <div class="ioe-badge-icon">IOE</div>
-        <span class="ioe-pill-title">English Master v3.8</span>
+        <span class="ioe-pill-title">English Master v3.9</span>
         <span id="ioe-audio-detected-badge" class="ioe-audio-pill hidden" title="Phát hiện bài thi nghe">🎧 Audio</span>
         <span id="ioe-game-api-badge" class="ioe-api-pill hidden" title="Đã đọc đề trực tiếp từ API game">🎮 API</span>
         <div class="ioe-pill-btn-group">
@@ -3638,7 +3764,16 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
     }
 
     // 2. Multi-Shot Auto-Scroll Screenshot
-    const capturedImages = await captureSmartScreenshotsWithAutoScroll();
+    // BUG#50: đề NGHE True/False (mỗi câu một file nghe) có đáp án nằm TRỌN trong
+    // audio, còn phần chữ đã chính xác 100% từ API game. Ảnh chụp màn hình không
+    // thêm thông tin nào, nhưng lại đặt hasImages=true ở service worker → Groq
+    // (model chữ, không vision) bị loại khỏi chuỗi provider → bài rơi vào Gemini
+    // 429 dù Groq còn quota. Bỏ hẳn ảnh cho đúng dạng đề này.
+    // KHÔNG mở rộng điều kiện sang bài đọc: đoạn văn của reading_tf chỉ nằm trong
+    // ảnh (BUG#47: "Không đọc được đoạn văn"), bỏ ảnh ở đó là hỏng thật.
+    const audioCoversAllQuestions = apiQuestions.length > 1 && apiQuestions.every(q => q.isListening);
+    const skipScreenshot = isMultiTfExam || (isDonRacUrl && audioCoversAllQuestions);
+    const capturedImages = skipScreenshot ? [] : await captureSmartScreenshotsWithAutoScroll();
 
     const capturedBase64 = (audioData && audioData.base64) ? audioData.base64 : ((window.__LAST_CAPTURED_IOE_AUDIO__ && window.__LAST_CAPTURED_IOE_AUDIO__.base64) ? window.__LAST_CAPTURED_IOE_AUDIO__.base64 : null);
     const activeAudioUrl = (audioData && audioData.url) ? audioData.url : (window.__LAST_CAPTURED_IOE_AUDIO__ ? window.__LAST_CAPTURED_IOE_AUDIO__.url : null);
@@ -3650,6 +3785,7 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
       audioUrl: activeAudioUrl,
       audioBase64: capturedBase64,
       audioUrls: multiAudioUrls,
+      skipScreenshot,
       hint: effectiveHint,
       examKind: isMultiTfExam ? "tf" : null
     }, (resp) => {

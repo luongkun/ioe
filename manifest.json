@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "English Master AI - Trợ Lý Giải Bài Tiếng Anh & IOE",
-  "version": "3.8",
+  "version": "3.9",
   "description": "Giải bài tập tiếng Anh thông minh bằng AI: trắc nghiệm, điền từ, ghép cặp, bài nghe True/False trên IOE (ioe.vn) bằng Multimodal AI.",
   "permissions": [
     "storage",
@@ -14,6 +14,7 @@
     "<all_urls>",
     "https://generativelanguage.googleapis.com/*",
     "https://api.groq.com/*",
+    "https://api.cloudflare.com/*",
     "https://cdn-s3.vtconline.vn/*",
     "*://*.ioe.vn/*",
     "*://ioe.vn/*"

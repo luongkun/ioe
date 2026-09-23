@@ -86,10 +86,46 @@
         <button id="opt-groq-test-btn" class="btn btn-outline btn-sm">⚡ Kiểm Tra Groq</button>
       </div>
       <div id="opt-groq-msg" class="info-msg hidden"></div>
-      <label class="switch-row" style="margin-top: 10px;">
-        <span>Ưu tiên Groq (tiết kiệm quota Gemini)</span>
-        <input type="checkbox" id="opt-prefer-groq" checked>
-      </label>
+    </div>
+
+    <div class="settings-card" style="margin-top: 15px;">
+      <h3>☁️ Cloudflare Workers AI (MIỄN PHÍ — provider dự phòng thứ ba)</h3>
+      <p class="settings-desc">
+        Groq và Gemini là hai vendor khác nhau, nhưng nếu cả hai cùng cạn quota thì vẫn tắc.
+        Cloudflare là <strong>vendor thứ ba</strong> với hạn mức riêng: <strong>10.000 Neurons/ngày</strong>,
+        <strong>không cần thẻ tín dụng</strong>, có cả model chữ và Whisper để nghe audio.
+        Để trống cũng được: extension sẽ tự bỏ qua Cloudflare.
+        <br><strong>Cần 2 thứ:</strong>
+        <br>1. <em>API Token</em> → <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank">dash.cloudflare.com/profile/api-tokens</a>
+        → Create Token → chọn template <em>Workers AI</em> (hoặc quyền <em>Workers AI - Read</em>).
+        <br>2. <em>Account ID</em> → <a href="https://dash.cloudflare.com" target="_blank">dash.cloudflare.com</a>
+        → <em>Workers &amp; Pages</em> → nhìn cột phải, chuỗi hex 32 ký tự.
+      </p>
+      <div class="input-with-button">
+        <input type="password" id="opt-cf-key" class="form-input" placeholder="Cloudflare API Token">
+        <button id="opt-toggle-cf" class="btn btn-icon">👁️</button>
+      </div>
+      <div class="input-with-button" style="margin-top: 8px;">
+        <input type="text" id="opt-cf-account" class="form-input" placeholder="Account ID (hex 32 ký tự)">
+      </div>
+      <div class="btn-group-row" style="margin-top: 10px;">
+        <button id="opt-cf-test-btn" class="btn btn-outline btn-sm">⚡ Kiểm Tra Cloudflare</button>
+      </div>
+      <div id="opt-cf-msg" class="info-msg hidden"></div>
+    </div>
+
+    <div class="settings-card" style="margin-top: 15px;">
+      <h3>🔀 Thứ tự ưu tiên provider</h3>
+      <p class="settings-desc">
+        Chọn provider chạy TRƯỚC. Sau nó, extension tự thử lần lượt
+        <strong>Groq → Cloudflare → Gemini</strong> và bỏ qua provider chưa có key,
+        nên một provider chết không làm mất hẳn đường giải.
+      </p>
+      <select id="opt-prefer-provider" class="form-select">
+        <option value="groq">Groq trước (mặc định — nhanh, 1000 request/ngày)</option>
+        <option value="cloudflare">Cloudflare trước (10.000 Neurons/ngày)</option>
+        <option value="gemini">Gemini trước (chất lượng cao nhất, nhưng chỉ 20 request/phút)</option>
+      </select>
     </div>
 
     <div class="settings-card" style="margin-top: 15px;">

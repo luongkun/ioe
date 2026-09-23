@@ -1,1 +1,3 @@
 .test-profile
+# Thư mục trạng thái do Freebuff desktop tự tạo khi mở project này
+.freebuff/

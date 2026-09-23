@@ -31,7 +31,19 @@ const DEFAULT_CONFIG = {
   groqApiKey: "",
   groqModel: "openai/gpt-oss-120b",
   groqWhisperModel: "whisper-large-v3-turbo",
-  // "groq" = Groq trước (tiết kiệm quota Gemini), "gemini" = Gemini trước.
+  // BUG#48 (22/09/2026): Cloudflare Workers AI làm provider thứ BA. Đây là vendor
+  // KHÁC hẳn Groq và Google nên hạn mức độc lập — Groq cạn thì vẫn còn đường.
+  // Free: 10.000 Neurons/ngày, KHÔNG cần thẻ tín dụng.
+  //   - chat:  OpenAI-compatible THẬT → /ai/v1/chat/completions
+  //   - audio: KHÔNG nằm trong bộ OpenAI-compatible → phải gọi REST run endpoint
+  //            /ai/run/<model>, body là BYTES thô, trả về {result:{text}}.
+  // Account ID: dash.cloudflare.com → Workers & Pages → cột phải (hex 32 ký tự).
+  cfApiKey: "",
+  cfAccountId: "",
+  cfModel: "@cf/openai/gpt-oss-120b",
+  cfWhisperModel: "@cf/openai/whisper-large-v3-turbo",
+  // Provider chạy TRƯỚC: "groq" | "cloudflare" | "gemini". Sau nó là chuỗi mặc
+  // định groq → cloudflare → gemini (provider thiếu key bị loại khỏi chuỗi).
   preferProvider: "groq"
 };
 
@@ -47,6 +59,34 @@ const FALLBACK_MODELS = [
   "gemini-flash-lite-latest",
   "gemini-3.5-flash"
 ];
+
+// BUG#49 (22/09/2026): 429 của Google có HAI loại rất khác nhau, bản cũ gộp làm
+// một nên vừa đốt quota vừa báo sai cho người dùng.
+//
+//   (a) QUOTA THEO PROJECT — thông điệp chứa metric dạng
+//       `generate_content_free_tier_requests`. Hạn mức này tính theo PROJECT và
+//       MỌI model dùng CHUNG một rổ, nên chuyển model KHÔNG cứu được gì — mà mỗi
+//       lần thử còn ăn thêm 1 request vào đúng cái rổ đang cạn. Đo thực tế 22/09/2026
+//       (Vòng 7 Bài 4): retry-after của Google tăng dần 14.7s → 45.5s → 41.7s → 38.0s
+//       chính vì các lần thử trước đang tiêu hạn mức. Gặp loại này phải DỪNG NGAY.
+//   (b) 429 theo RIÊNG model (RPM/TPM của model đó) — chuyển model là ĐÚNG.
+function isProjectQuotaError(err) {
+  if (!err || err.status !== 429) return false;
+  const msg = String(err.message || "");
+  return /quota exceeded for metric/i.test(msg) && /free[\s_-]?tier/i.test(msg);
+}
+
+// Google trả kèm thời gian chờ trong CHÍNH thông điệp lỗi, ví dụ
+// "... Please retry in 14.751975244s." — dùng số thật của server thay vì đoán
+// "chờ 1-2 phút" như bản cũ.
+function parseRetryAfterSeconds(err) {
+  const msg = String((err && err.message) || "");
+  const m = msg.match(/retryDelay"?\s*[:=]\s*"?(\d+(?:\.\d+)?)s/i)
+         || msg.match(/retry in\s+(\d+(?:\.\d+)?)\s*s/i);
+  if (!m) return null;
+  const n = Math.ceil(parseFloat(m[1]));
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -325,6 +365,102 @@ async function callGroqChat(apiKey, model, systemPrompt, userPrompt, imageBase64
   return txt;
 }
 
+// ===== BUG#48: Cloudflare Workers AI =====
+// Hai điểm khác Groq phải nhớ khi sửa file này:
+//   1. URL có thêm ACCOUNT ID trong đường dẫn (Groq không có).
+//   2. Audio dùng REST run endpoint chứ không phải OpenAI-compatible.
+const CF_API_BASE = "https://api.cloudflare.com/client/v4/accounts";
+
+function cfUrl(accountId, path) {
+  const acc = String(accountId || "").trim();
+  if (!acc) {
+    throw new Error("Chưa có Cloudflare Account ID. Lấy tại dash.cloudflare.com → Workers & Pages → cột phải (chuỗi hex 32 ký tự) → dán vào trang Cài đặt của extension.");
+  }
+  return `${CF_API_BASE}/${encodeURIComponent(acc)}/ai${path}`;
+}
+
+// Phần lớn model Workers AI là TEXT-ONLY. Khai báo model có vision ở đây để
+// không gửi content part dạng ảnh vào model chữ (Cloudflare trả lỗi 400).
+function cfSupportsImages(model) {
+  return /llama-4-(scout|maverick)|llava|llama-3\.2-11b|vision/i.test(String(model || ""));
+}
+
+async function cfTranscribe(apiKey, accountId, audioObj, whisperModel) {
+  if (!audioObj || !audioObj.base64) return null;
+  // cfUrl nằm NGOÀI try: thiếu Account ID là lỗi cấu hình của người dùng, phải
+  // hiện nguyên văn hướng dẫn dẫn thay vì bị nuốt thành "không phiên âm được".
+  const url = cfUrl(accountId, "/run/" + encodeURIComponent(whisperModel || DEFAULT_CONFIG.cfWhisperModel));
+  try {
+    const bin = atob(audioObj.base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + apiKey.trim(),
+        "Content-Type": audioObj.mimeType || "audio/mp3"
+      },
+      body: bytes,
+      signal: AbortSignal.timeout(120000)
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok || j.success === false) {
+      const msg = j.errors?.[0]?.message || j.error?.message || ("Cloudflare Whisper HTTP " + res.status);
+      const err = new Error(msg);
+      err.status = res.status;
+      throw err;
+    }
+    // Cloudflare trả {result:{text}}; một số biến thể trả thẳng {result:"..."}.
+    const txt = typeof j.result === "string" ? j.result : (j.result && j.result.text) || "";
+    return String(txt || "").trim() || null;
+  } catch (e) {
+    console.warn("[English Master AI] Cloudflare Whisper lỗi:", e && e.message);
+    return null;
+  }
+}
+
+async function callCfChat(apiKey, accountId, model, systemPrompt, userPrompt, imageBase64) {
+  const messages = [];
+  if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
+  if (imageBase64 && cfSupportsImages(model)) {
+    const imgs = Array.isArray(imageBase64) ? imageBase64 : [imageBase64];
+    const content = [{ type: "text", text: userPrompt }];
+    for (const img of imgs) {
+      if (!img) continue;
+      const clean = img.replace(/^data:image\/[a-z]+;base64,/, "");
+      content.push({ type: "image_url", image_url: { url: "data:image/png;base64," + clean } });
+    }
+    messages.push({ role: "user", content });
+  } else {
+    messages.push({ role: "user", content: userPrompt });
+  }
+
+  const res = await fetch(cfUrl(accountId, "/v1/chat/completions"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + apiKey.trim() },
+    body: JSON.stringify({ model, messages, temperature: 0.1, max_tokens: 8192 }),
+    signal: AbortSignal.timeout(60000)
+  }).catch((e) => {
+    if (e && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      const err = new Error("Hết giờ 60s chờ Cloudflare phản hồi.");
+      err.status = 0;
+      throw err;
+    }
+    throw e;
+  });
+
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || j.success === false) {
+    const msg = j.errors?.[0]?.message || j.error?.message || ("HTTP " + res.status);
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  const txt = j.choices?.[0]?.message?.content;
+  if (!txt) throw new Error("Cloudflare không trả về kết quả hợp lệ.");
+  return txt;
+}
+
 // Dựng prompt dùng chung cho CẢ hai provider (tách khỏi callGeminiWithFallback để
 // không phải viết lại toàn bộ khối chỉ thị examKind cho Groq).
 function buildFullPrompt(text, taskType, customHint, audioObj, audioList, examKind, transcript) {
@@ -411,37 +547,61 @@ async function saveSolveHistory(taskType, audioObj, audioList, text, answer) {
   } catch (e) {}
 }
 
-// BUG#46: Groq trước (không tốn quota Gemini), Gemini dự phòng. Ảnh luôn phải
-// qua Gemini vì model chữ của Groq không có vision.
-async function callGroqWithFallback(text, taskType, groqKey, model, imageBase64, audioObj, customHint, audioList, examKind) {
+// BUG#48: quy tắc phiên âm + gắn nhãn tách ra dùng CHUNG cho Groq và Cloudflare.
+// Trước đây khối này viết thẳng trong callGroqWithFallback; thêm provider thứ ba
+// mà copy nguyên khối thì chỉ cần sửa nhãn ở một bên là hai bên lệch nhau ngay.
+// BUG#47b (đề nghe TF dùng MỘT file cho cả bài): nhãn phải nói rõ file phục vụ
+// MỌI CÂU — gắn "[AUDIO CÂU 1]" khiến model tưởng file chỉ ứng với câu 1.
+async function buildTranscript(transcribeFn, audioObj, audioList, providerName) {
   let transcript = null;
   if (audioObj && audioObj.base64) {
-    transcript = await groqTranscribe(groqKey, audioObj, DEFAULT_CONFIG.groqWhisperModel);
-    if (!transcript) throw new Error("Groq Whisper không phiên âm được file nghe.");
+    transcript = await transcribeFn(audioObj);
+    if (!transcript) throw new Error(providerName + " Whisper không phiên âm được file nghe.");
   }
-  // Nhiều file audio (mỗi câu 1 file) → phiên âm từng file, gắn nhãn theo câu.
-  // BUG#47b: đề nghe TF dùng MỘT file chung cho cả bài — gắn nhãn "[AUDIO CÂU 1]"
-  // cho nó sẽ khiến model tưởng file chỉ ứng với câu 1. Nhãn phải nói rõ là bài
-  // nghe của CẢ BÀI.
   if (Array.isArray(audioList) && audioList.length) {
     const parts = [];
     for (const a of audioList) {
+      let label;
       if (a && a.base64) {
-        const t = await groqTranscribe(groqKey, a, DEFAULT_CONFIG.groqWhisperModel);
-        const label = audioList.length === 1 ? "[BÀI NGHE — DÙNG CHUNG CHO MỌI CÂU]"
-                                             : "[AUDIO CÂU " + (a.qIndex || parts.length + 1) + "]";
+        const t = await transcribeFn(a);
+        label = audioList.length === 1 ? "[BÀI NGHE — DÙNG CHUNG CHO MỌI CÂU]"
+                                      : "[AUDIO CÂU " + (a.qIndex || parts.length + 1) + "]";
         parts.push(label + ": " + (t || "(không phiên âm được)"));
       } else {
-        const label = audioList.length === 1 ? "[BÀI NGHE — DÙNG CHUNG CHO MỌI CÂU]"
-                                             : "[AUDIO CÂU " + (a && a.qIndex || parts.length + 1) + "]";
+        label = audioList.length === 1 ? "[BÀI NGHE — DÙNG CHUNG CHO MỌI CÂU]"
+                                      : "[AUDIO CÂU " + (a && a.qIndex || parts.length + 1) + "]";
         parts.push(label + ": (thiếu file audio)");
       }
     }
     transcript = parts.join("\n\n");
   }
+  return transcript;
+}
+
+// BUG#46: Groq trước (không tốn quota Gemini). Ảnh luôn phải qua provider có
+// vision vì model chữ của Groq không có vision.
+async function callGroqWithFallback(text, taskType, groqKey, model, imageBase64, audioObj, customHint, audioList, examKind) {
+  const transcript = await buildTranscript(
+    (a) => groqTranscribe(groqKey, a, DEFAULT_CONFIG.groqWhisperModel),
+    audioObj, audioList, "Groq"
+  );
 
   const fullPrompt = buildFullPrompt(text, taskType, customHint, audioObj, audioList, examKind, transcript);
   const answer = await callGroqChat(groqKey, model, null, fullPrompt, imageBase64);
+  await saveSolveHistory(taskType, audioObj, audioList, text, answer);
+  return answer;
+}
+
+// BUG#48: đường Cloudflare. Cùng hình dạng với Groq (audio phiên âm TRƯỚC rồi
+// nhồi transcript vào prompt chữ) nhưng dùng endpoint và vendor khác.
+async function callCfWithFallback(text, taskType, cfKey, accountId, model, imageBase64, audioObj, customHint, audioList, examKind) {
+  const transcript = await buildTranscript(
+    (a) => cfTranscribe(cfKey, accountId, a, DEFAULT_CONFIG.cfWhisperModel),
+    audioObj, audioList, "Cloudflare"
+  );
+
+  const fullPrompt = buildFullPrompt(text, taskType, customHint, audioObj, audioList, examKind, transcript);
+  const answer = await callCfChat(cfKey, accountId, model, null, fullPrompt, imageBase64);
   await saveSolveHistory(taskType, audioObj, audioList, text, answer);
   return answer;
 }
@@ -466,6 +626,7 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
   const modelQueue = [primaryModel, ...FALLBACK_MODELS.filter(m => m !== primaryModel)];
 
   let lastError = null;
+  let projectQuotaError = null;
   for (const model of modelQueue) {
     try {
       console.log(`[English Master AI] Trying model: ${model}...`);
@@ -523,10 +684,30 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
       // Rate-limit (429) or server-side (5xx) errors are usually transient — pause
       // briefly so the next fallback model isn't hit instantly while the quota is
       // still exhausted / the outage is ongoing.
+      // BUG#49: quota tính theo PROJECT → MỌI model dùng chung một rổ. Thử model
+      // kế tiếp không cứu được gì, chỉ ăn thêm 1 request vào đúng cái rổ đang cạn
+      // và đẩy chính retry-after của mình lên cao hơn. Dừng hẳn chuỗi NGAY.
+      if (isProjectQuotaError(err)) {
+        projectQuotaError = err;
+        console.warn("[English Master AI] Hết quota Gemini theo PROJECT — dừng chuỗi model tại " + model + " (mọi model dùng chung hạn mức, thử thêm chỉ làm cạn nhanh hơn).");
+        break;
+      }
       if (err.status === 429 || (err.status >= 500 && err.status < 600)) {
         await sleep(500);
       }
     }
+  }
+
+  // BUG#49: hết quota theo project — thông báo phải NÓI RÕ vì sao không thử tiếp
+  // các model còn lại (người dùng sẽ tưởng extension bỏ sót model nào đó), kèm
+  // thời gian chờ THẬT của Google và cách chữa gốc.
+  if (projectQuotaError) {
+    const wait = parseRetryAfterSeconds(projectQuotaError);
+    throw new Error(
+      "Hết quota Gemini free tier (429). Hạn mức này tính theo PROJECT và TẤT CẢ model dùng CHUNG một rổ, nên extension DỪNG ngay chứ không thử " + modelQueue.length + " model — thử thêm chỉ ăn thêm request vào chính hạn mức đang cạn."
+      + (wait ? " Google nói thử lại sau khoảng " + wait + " giây." : " Chờ 1-2 phút rồi bấm giải lại.")
+      + " Cách chữa gốc: thêm key Groq (console.groq.com/keys) hoặc Cloudflare (dash.cloudflare.com) ở trang Cài đặt — hai provider này có hạn mức RIÊNG, không dùng chung với Gemini. Chi tiết Google: " + String(projectQuotaError.message)
+    );
   }
 
   // BUG#16: thông điệp cuối trung thực theo loại lỗi thật — chỉ 429 mới là "quá tải"
@@ -537,57 +718,89 @@ async function callGeminiWithFallback(text, taskType, customApiKey, customModel,
   throw new Error(`Không gọi được AI (đã thử ${modelQueue.length} model): ${lastMsg}`);
 }
 
-// BUG#46: điều phối provider. Groq chỉ dùng được khi KHÔNG có ảnh (model chữ của
-// Groq không có vision) — có ảnh thì Gemini là đường duy nhất, thử Groq chỉ tốn
-// thời gian rồi nhận 400. Không có key Groq → Gemini như cũ (tương thích ngược).
+// BUG#46 + BUG#48: điều phối provider theo CHUỖI (không còn cứng 2 nhánh).
+// Thứ tự: provider người dùng chọn trước, rồi tới chuỗi mặc định
+// groq → cloudflare → gemini. Provider thiếu key — hoặc có ảnh mà không có
+// vision — bị LOẠI KHỎI chuỗi ngay từ đầu. Đây là bất biến BUG#46a: bản đầu để
+// dự phòng trỏ vào chính provider vừa dùng được nên đường có ẢNH gọi Gemini HAI
+// lần liên tiếp (lần hai chắc chắn fail y hệt, chỉ tốn thời gian và nhân đôi
+// request đốt quota). Live-caught bằng unit test.
 async function solveWithAi(text, taskType, opts = {}) {
   const config = await chrome.storage.local.get(DEFAULT_CONFIG);
   const groqKey = String(opts.groqApiKey || config.groqApiKey || "").trim();
   const groqModel = opts.groqModel || config.groqModel || DEFAULT_CONFIG.groqModel;
+  const cfKey = String(opts.cfApiKey || config.cfApiKey || "").trim();
+  const cfAccountId = String(opts.cfAccountId || config.cfAccountId || "").trim();
+  const cfModel = opts.cfModel || config.cfModel || DEFAULT_CONFIG.cfModel;
   const prefer = opts.preferProvider || config.preferProvider || DEFAULT_CONFIG.preferProvider;
 
+  // Cổng này là hàng rào NGỮ NGHĨA, không phải kỹ thuật: callGroqChat/callCfChat
+  // vốn đã tự bỏ qua ảnh khi model không có vision, nên nếu chỉ vì kỹ thuật thì cổng
+  // là dư. Nó tồn tại để một đề MÀ ĐÁP ÁN CHỈ NẰM TRONG ẢNH không bị model chữ đoán
+  // mò rồi trả lời bừa. Vì vậy đừng gỡ cổng — hãy bỏ ẢNH ở nơi sinh ra nó khi ảnh
+  // thật sự vô dụng (BUG#50: đề nghe TF nhiều file, xem content/ioe/ioe.js).
   const hasImages = !!(opts.imageBase64 && (Array.isArray(opts.imageBase64) ? opts.imageBase64.length : true));
-  const groqUsable = !!groqKey && !hasImages;
 
-  const callGemini = () => callGeminiWithFallback(
-    text, taskType, opts.apiKey, opts.model,
-    opts.imageBase64 || null, opts.audioObj || null, opts.hint || "",
-    opts.audioList || null, opts.examKind || null
-  );
-  const callGroq = () => callGroqWithFallback(
-    text, taskType, groqKey, groqModel,
-    opts.imageBase64 || null, opts.audioObj || null, opts.hint || "",
-    opts.audioList || null, opts.examKind || null
-  );
+  const providers = {
+    // Gemini luôn nằm trong chuỗi: thiếu key thì chính nó ném hướng dẫn nhập key,
+    // giữ đúng hành vi tương thích ngược của bản cũ (chỉ Gemini, không Groq).
+    gemini: {
+      name: "Gemini",
+      usable: true,
+      call: () => callGeminiWithFallback(
+        text, taskType, opts.apiKey, opts.model,
+        opts.imageBase64 || null, opts.audioObj || null, opts.hint || "",
+        opts.audioList || null, opts.examKind || null
+      )
+    },
+    groq: {
+      name: "Groq",
+      usable: !!groqKey && !hasImages,
+      call: () => callGroqWithFallback(
+        text, taskType, groqKey, groqModel,
+        opts.imageBase64 || null, opts.audioObj || null, opts.hint || "",
+        opts.audioList || null, opts.examKind || null
+      )
+    },
+    cloudflare: {
+      name: "Cloudflare",
+      // Cần CẢ token lẫn Account ID (URL có account trong đường dẫn).
+      usable: !!cfKey && !!cfAccountId && (!hasImages || cfSupportsImages(cfModel)),
+      call: () => callCfWithFallback(
+        text, taskType, cfKey, cfAccountId, cfModel,
+        opts.imageBase64 || null, opts.audioObj || null, opts.hint || "",
+        opts.audioList || null, opts.examKind || null
+      )
+    }
+  };
 
-  // BUG#46a: khi KHÔNG dùng được Groq (có ảnh / thiếu key) thì dự phòng phải là
-  // null — bản đầu đặt second = callGemini trong mọi nhánh, nên đường có ẢNH gọi
-  // Gemini HAI lần liên tiếp (lần hai chắc chắn fail y hệt, chỉ tốn thời gian và
-  // nhân đôi số request đốt quota). Live-caught bằng unit test.
-  let first, second;
-  if (!groqUsable) {
-    first = callGemini; second = null;
-  } else if (prefer === "gemini") {
-    first = callGemini; second = callGroq;
-  } else {
-    first = callGroq; second = callGemini;
+  const DEFAULT_PROVIDER_ORDER = ["groq", "cloudflare", "gemini"];
+  const order = [prefer, ...DEFAULT_PROVIDER_ORDER.filter((p) => p !== prefer)];
+  const chain = order.map((k) => providers[k]).filter((p) => p && p.usable);
+
+  if (!chain.length) {
+    throw new Error("Chưa có provider AI nào dùng được. Cần ít nhất một key: Gemini (aistudio.google.com/app/apikey), Groq (console.groq.com/keys) hoặc Cloudflare (dash.cloudflare.com).");
   }
 
-  try {
-    const r = await first();
-    console.log("[English Master AI] ✅ Giải bằng " + (first === callGroq ? "Groq" : "Gemini"));
-    return r;
-  } catch (e1) {
-    if (!second) throw e1;
-    console.warn("[English Master AI] ⚠️ Provider ưu tiên lỗi (" + (e1 && e1.message) + ") — chuyển provider dự phòng...");
+  const failures = [];
+  for (let i = 0; i < chain.length; i++) {
+    const p = chain[i];
     try {
-      const r = await second();
-      console.log("[English Master AI] ✅ Giải bằng provider dự phòng");
+      const r = await p.call();
+      console.log("[English Master AI] ✅ Giải bằng " + p.name);
       return r;
-    } catch (e2) {
-      throw new Error("Cả 2 provider đều lỗi. Ưu tiên: " + (e1 && e1.message) + " | Dự phòng: " + (e2 && e2.message));
+    } catch (e) {
+      failures.push({ name: p.name, err: e });
+      if (i < chain.length - 1) {
+        console.warn("[English Master AI] ⚠️ " + p.name + " lỗi (" + (e && e.message) + ") — chuyển provider kế tiếp...");
+      }
     }
   }
+
+  // Chỉ một provider dùng được → ném ĐÚNG lỗi gốc (không bọc lại), để các thông
+  // báo hướng dẫn dài (thiếu key, bị suspend, geo-block...) hiện nguyên văn.
+  if (failures.length === 1) throw failures[0].err;
+  throw new Error("Cả " + failures.length + " provider đều lỗi → " + failures.map((f) => f.name + ": " + (f.err && f.err.message)).join(" | "));
 }
 
 // Chrome throttles captureVisibleTab to 2 calls/second. The auto-scroll solver
@@ -692,6 +905,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           model: request.model,
           groqApiKey: request.groqApiKey,
           groqModel: request.groqModel,
+          cfApiKey: request.cfApiKey,
+          cfAccountId: request.cfAccountId,
+          cfModel: request.cfModel,
           preferProvider: request.preferProvider,
           imageBase64: imagePayload,
           audioObj,
@@ -710,6 +926,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
+    // BUG#50: đề NGHE True/False nhiều file — content script đã chủ động bỏ ảnh vì
+    // đáp án nằm trọn trong audio. Nếu ở đây tự chụp bù thì hasImages lại thành true
+    // và Groq bị loại khỏi chuỗi y như cũ. Tôn trọng cờ và đi thẳng, ảnh = null.
+    if (request.skipScreenshot) {
+      handleSolveWithImages(null);
+      return true;
+    }
+
     captureVisibleTabWithRetry(windowId)
       .then((dataUrl) => handleSolveWithImages(dataUrl))
       .catch((err) => sendResponse({ success: false, error: "Không thể chụp màn hình tab: " + err.message }));
@@ -722,6 +946,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       model: request.model,
       groqApiKey: request.groqApiKey,
       groqModel: request.groqModel,
+      cfApiKey: request.cfApiKey,
+      cfAccountId: request.cfAccountId,
+      cfModel: request.cfModel,
       preferProvider: request.preferProvider,
       imageBase64: request.image,
       hint: request.hint
@@ -742,6 +969,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           const model = request.model || config.groqModel || DEFAULT_CONFIG.groqModel;
           const out = await callGroqChat(key, model, null, "Reply with exactly: OK", null);
           if (!/ok/i.test(String(out))) throw new Error("Groq trả về kết quả bất thường: " + String(out).slice(0, 120));
+          sendResponse({ success: true });
+        } catch (e) {
+          sendResponse({ success: false, error: e.message });
+        }
+      })();
+      return true;
+    }
+    // BUG#48: provider "cloudflare" cần tới 2 thứ (token + Account ID) nên phải
+    // báo thiếu cái nào cụ thể, không được gộp thành "key sai".
+    if (request.provider === "cloudflare") {
+      (async () => {
+        try {
+          const config = await chrome.storage.local.get(DEFAULT_CONFIG);
+          const key = String(request.apiKey || config.cfApiKey || "").trim();
+          const acc = String(request.accountId || config.cfAccountId || "").trim();
+          if (!key) throw new Error("Chưa có Cloudflare API Token. Tạo tại dash.cloudflare.com → My Profile → API Tokens → Create Token (chọn quyền 'Workers AI - Read').");
+          if (!acc) throw new Error("Chưa có Cloudflare Account ID. Lấy tại dash.cloudflare.com → Workers & Pages → cột phải (chuỗi hex 32 ký tự).");
+          const model = request.model || config.cfModel || DEFAULT_CONFIG.cfModel;
+          const out = await callCfChat(key, acc, model, null, "Reply with exactly: OK", null);
+          if (!/ok/i.test(String(out))) throw new Error("Cloudflare trả về kết quả bất thường: " + String(out).slice(0, 120));
           sendResponse({ success: true });
         } catch (e) {
           sendResponse({ success: false, error: e.message });

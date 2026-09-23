@@ -1390,6 +1390,31 @@
     return n;
   }
 
+  // BUG#52 (live 23/09/2026, don-rac-bai-bien — Vòng 4 Bài 1): phân biệt game
+  // đọc hiểu TỪNG CÂU với game trắc nghiệm/chọn cặp. Hai chế độ này cần cách
+  // giải khác hẳn nhau, mà TÊN GAME không dùng được (tên là dữ liệu, mỗi vòng
+  // một khác). Dấu hiệu đáng tin là NODE CÂU HỎI ĐANG HIỆN:
+  //   • nConversationQuest → mỗi câu có đoạn văn riêng, phải đọc lại từng câu
+  //   • nTracNghiem        → không có đoạn văn, một lượt AI cho cả bài
+  // Live-verified: don-rac-bai-bien có nConversationQuest active và passage đổi
+  // thật giữa các câu ("Generation Y…" → "Fred Lorz…"); an-khe-tra-vang (100
+  // điểm) không có đoạn văn nào, prompt toàn từ đơn (sorrow/polite/…).
+  function activeQuestionMode() {
+    const out = { conversation: false, tracNghiem: false, node: null };
+    const cc = getCC();
+    if (!cc || !cc.director || !cc.director.getScene) return out;
+    (function walk(n) {
+      if (!n) return;
+      let act = true;
+      try { act = n.activeInHierarchy !== false; } catch (e) {}
+      if (act && n.name === "nConversationQuest") { out.conversation = true; out.node = n.name; }
+      if (act && n.name === "nTracNghiem") { out.tracNghiem = true; if (!out.node) out.node = n.name; }
+      const kids = n.children;
+      if (kids) for (let i = 0; i < kids.length; i++) walk(kids[i]);
+    })(cc.director.getScene());
+    return out;
+  }
+
   function clickQuestItem(index) {
     const cc = getCC();
     if (!cc || !cc.director || !cc.director.getScene || index === undefined || index === null) return { ok: false, reason: "bad_args" };
@@ -1475,14 +1500,28 @@
       nodes.push(n);
       (n.children || []).forEach(c => walk(c, d + 1));
     })(cc.director.getScene(), 0);
+    // BUG#55 (live 23/09/2026, chinh-phuc-fansipan — Vòng 7 Bài 2, 70 điểm):
+    // game đọc hiểu True/False dựng HAI node cùng tên `content_scroll` — một node
+    // chứa ĐOẠN VĂN (320 ký tự) và một node chứa CÂU KHẲNG ĐỊNH (107 ký tự).
+    // Bản cũ trả về node ĐẦU TIÊN khớp tên có text >= 40 ký tự, nên khi node câu
+    // hỏi đứng trước trong thứ tự duyệt thì nó che mất đoạn văn thật:
+    // `getPassageText()` trả 107 ký tự (là CÂU HỎI) → `looksLikePassage()` đòi
+    // >= 180 nên loại → solver log "⚠️ Không đọc được đoạn văn" → AI đoán
+    // True/False không ngữ cảnh (live: 30/100, rồi 40/100, rồi 70/100).
+    // Sửa: trong CÙNG một tên, chọn text DÀI NHẤT thay vì text đầu tiên. Thứ tự
+    // ưu tiên theo TÊN giữ nguyên (đoạn văn thật vẫn thắng scrollRtext của màn
+    // hướng dẫn), nhưng node ngắn không còn che được node dài.
     for (const name of PASSAGE_NODES) {
+      let best = "";
       for (const n of nodes) {
         try { if (n.activeInHierarchy === false) continue; } catch (e) { continue; }
         if (n.name !== name) continue;
         // labelOf đã stripRichText → đoạn văn liền mạch, không dính markup.
         const t = labelOf(n) || nodeText(n, 12);
-        if (t && String(t).trim().length >= 40) return String(t).trim();
+        const s = t ? String(t).trim() : "";
+        if (s.length > best.length) best = s;
       }
+      if (best.length >= 40) return best;
     }
     // Fallback: controller (game đọc hiểu đời cũ có desStrContent).
     try {
@@ -2017,6 +2056,13 @@
           // BUG#40: đếm ô chuyển câu đang active để biết game có nhiều câu trên
           // một màn hay không (an-khe-tra-vang = 5, game một-câu-một-màn = 0).
           reply(reqId, "COUNT_QUEST_ITEMS_OK", { count: countQuestItems() });
+          break;
+        case "ACTIVE_QUESTION_MODE":
+          // BUG#52: game đọc hiểu TỪNG CÂU (nConversationQuest) có ĐOẠN VĂN RIÊNG
+          // cho mỗi câu, còn trắc nghiệm/chọn cặp (nTracNghiem) thì không. Solver
+          // phải biết đang ở chế độ nào để đọc lại đoạn văn trước mỗi câu — đọc
+          // một lần rồi trả lời cả loạt là sai (live: 10/100).
+          reply(reqId, "ACTIVE_QUESTION_MODE_OK", activeQuestionMode());
           break;
         case "AUTO_MATCH":
           reply(reqId, "AUTO_MATCH_STARTED", { total: ((d.data || {}).pairs || []).length });

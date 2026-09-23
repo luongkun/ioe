@@ -17,7 +17,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   const toggleGroqBtn = document.getElementById("opt-toggle-groq");
   const groqTestBtn = document.getElementById("opt-groq-test-btn");
   const groqMsgEl = document.getElementById("opt-groq-msg");
-  const preferGroqToggle = document.getElementById("opt-prefer-groq");
+  // BUG#48: Cloudflare Workers AI — provider thứ ba, cần CẢ token lẫn Account ID
+  // vì URL của Cloudflare có account trong đường dẫn.
+  const cfKeyInput = document.getElementById("opt-cf-key");
+  const toggleCfBtn = document.getElementById("opt-toggle-cf");
+  const cfAccountInput = document.getElementById("opt-cf-account");
+  const cfTestBtn = document.getElementById("opt-cf-test-btn");
+  const cfMsgEl = document.getElementById("opt-cf-msg");
+  const preferProviderSelect = document.getElementById("opt-prefer-provider");
 
   // Load config
   const config = await chrome.storage.local.get({
@@ -25,6 +32,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     model: DEFAULT_MODEL,
     autoShowToolbar: true,
     groqApiKey: "",
+    cfApiKey: "",
+    cfAccountId: "",
     preferProvider: "groq"
   });
 
@@ -32,7 +41,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   modelSelect.value = config.model || DEFAULT_MODEL;
   autoToolbarToggle.checked = config.autoShowToolbar !== false;
   groqKeyInput.value = config.groqApiKey || "";
-  preferGroqToggle.checked = (config.preferProvider || "groq") !== "gemini";
+  cfKeyInput.value = config.cfApiKey || "";
+  cfAccountInput.value = config.cfAccountId || "";
+  // Bản cũ lưu preferProvider dạng nhị phân ("groq"/"gemini"). Nếu gặp giá trị lạ
+  // thì rơi về "groq" thay vì để select trống.
+  const savedPrefer = String(config.preferProvider || "groq").toLowerCase();
+  preferProviderSelect.value = ["groq", "cloudflare", "gemini"].includes(savedPrefer) ? savedPrefer : "groq";
 
   toggleKeyBtn.addEventListener("click", () => {
     apiKeyInput.type = apiKeyInput.type === "password" ? "text" : "password";
@@ -40,6 +54,10 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   toggleGroqBtn.addEventListener("click", () => {
     groqKeyInput.type = groqKeyInput.type === "password" ? "text" : "password";
+  });
+
+  toggleCfBtn.addEventListener("click", () => {
+    cfKeyInput.type = cfKeyInput.type === "password" ? "text" : "password";
   });
 
   saveBtn.addEventListener("click", async () => {
@@ -52,70 +70,66 @@ document.addEventListener("DOMContentLoaded", async () => {
       model: model,
       autoShowToolbar: autoToolbar,
       groqApiKey: groqKeyInput.value.trim(),
-      preferProvider: preferGroqToggle.checked ? "groq" : "gemini"
+      cfApiKey: cfKeyInput.value.trim(),
+      cfAccountId: cfAccountInput.value.trim(),
+      preferProvider: preferProviderSelect.value
     });
 
-    showMsg("Đã lưu cài đặt thành công!", "success");
+    showMsg(msgEl, "Đã lưu cài đặt thành công!", "success");
   });
 
   groqTestBtn.addEventListener("click", () => {
     const key = groqKeyInput.value.trim();
     if (!key) {
-      showGroqMsg("Vui lòng nhập Groq API Key trước khi kiểm tra.", "error");
+      showMsg(groqMsgEl, "Vui lòng nhập Groq API Key trước khi kiểm tra.", "error");
       return;
     }
-    groqTestBtn.disabled = true;
-    groqTestBtn.textContent = "⏳ Đang kiểm tra...";
-    chrome.runtime.sendMessage({ action: "TEST_API_KEY", provider: "groq", apiKey: key }, (resp) => {
-      groqTestBtn.disabled = false;
-      groqTestBtn.textContent = "⚡ Kiểm Tra Groq";
-      if (resp && resp.success) {
-        showGroqMsg("Groq hoạt động! Từ giờ extension sẽ ưu tiên Groq.", "success");
-      } else {
-        showGroqMsg("Lỗi: " + (resp?.error || "Không kết nối được."), "error");
-      }
-    });
+    runKeyTest(groqTestBtn, "⚡ Kiểm Tra Groq", { provider: "groq", apiKey: key }, groqMsgEl,
+      "Groq hoạt động! Extension sẽ dùng Groq theo thứ tự ưu tiên bạn chọn.");
   });
 
-  function showGroqMsg(text, type) {
-    groqMsgEl.textContent = text;
-    groqMsgEl.className = `info-msg ${type}`;
-    groqMsgEl.classList.remove("hidden");
-    setTimeout(() => groqMsgEl.classList.add("hidden"), 6000);
-  }
+  cfTestBtn.addEventListener("click", () => {
+    const key = cfKeyInput.value.trim();
+    const accountId = cfAccountInput.value.trim();
+    if (!key || !accountId) {
+      showMsg(cfMsgEl, "Cần ĐỦ CẢ API Token và Account ID mới kiểm tra được Cloudflare.", "error");
+      return;
+    }
+    runKeyTest(cfTestBtn, "⚡ Kiểm Tra Cloudflare", { provider: "cloudflare", apiKey: key, accountId }, cfMsgEl,
+      "Cloudflare hoạt động! Đây là provider dự phòng thứ ba khi Groq và Gemini cạn quota.");
+  });
 
   testBtn.addEventListener("click", () => {
     const key = apiKeyInput.value.trim();
     const model = modelSelect.value;
     if (!key) {
-      showMsg("Vui lòng nhập API Key trước khi kiểm tra.", "error");
+      showMsg(msgEl, "Vui lòng nhập API Key trước khi kiểm tra.", "error");
       return;
     }
-
-    testBtn.disabled = true;
-    testBtn.textContent = "⏳ Đang kiểm tra...";
-
-    chrome.runtime.sendMessage({
-      action: "TEST_API_KEY",
-      apiKey: key,
-      model: model
-    }, (resp) => {
-      testBtn.disabled = false;
-      testBtn.textContent = "⚡ Kiểm Tra Kết Nối";
-      if (resp && resp.success) {
-        showMsg("Kết nối thành công! Key hoạt động bình thường.", "success");
-      } else {
-        showMsg("Lỗi: " + (resp?.error || "Không kết nối được."), "error");
-      }
-    });
+    runKeyTest(testBtn, "⚡ Kiểm Tra Kết Nối", { apiKey: key, model }, msgEl,
+      "Kết nối thành công! Key hoạt động bình thường.");
   });
 
-  function showMsg(text, type) {
-    msgEl.textContent = text;
-    msgEl.className = `info-msg ${type}`;
-    msgEl.classList.remove("hidden");
-    setTimeout(() => {
-      msgEl.classList.add("hidden");
-    }, 4000);
+  // Chung cho cả 3 nút kiểm tra: khoá nút trong lúc chờ, nhãn nút phải khôi phục
+  // đúng như ban đầu nên nhận label qua tham số (bản cũ hardcode từng nút).
+  function runKeyTest(btn, label, payload, msgTarget, successText) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Đang kiểm tra...";
+    chrome.runtime.sendMessage(Object.assign({ action: "TEST_API_KEY" }, payload), (resp) => {
+      btn.disabled = false;
+      btn.textContent = label;
+      if (resp && resp.success) {
+        showMsg(msgTarget, successText, "success");
+      } else {
+        showMsg(msgTarget, "Lỗi: " + ((resp && resp.error) || "Không kết nối được."), "error");
+      }
+    });
+  }
+
+  function showMsg(el, text, type) {
+    el.textContent = text;
+    el.className = `info-msg ${type}`;
+    el.classList.remove("hidden");
+    setTimeout(() => el.classList.add("hidden"), 6000);
   }
 });
