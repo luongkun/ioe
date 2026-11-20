@@ -3728,6 +3728,10 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
 
     // 1. Deep Extract Full Passage Text (100% untruncated by scrollbars)
     let extractedPassage = "";
+    // BUG#56: cờ này nói rõ đề đã có dữ liệu từ API game hay không. Khi có, ảnh
+    // chụp màn hình không thêm thông tin nhưng lại khiến service worker đánh dấu
+    // hasImages=true → Groq (text-only) bị loại → rơi hẳn sang Gemini (BUG#57).
+    let passageFromApi = false;
     if (useOverride) {
       extractedPassage = options.textOverride.trim();
       if (readerText) readerText.value = extractedPassage;
@@ -3740,6 +3744,7 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
       const apiText = buildGameApiPromptText();
       if (apiText) {
         extractedPassage = apiText;
+        passageFromApi = true;
         requestGameBridgeSync();
         if (readerText) readerText.value = apiText;
         if (ioeRootEl) {
@@ -3772,7 +3777,14 @@ async function executeScreenAndAudioSolve(customHint = "", callback = null, opti
     // KHÔNG mở rộng điều kiện sang bài đọc: đoạn văn của reading_tf chỉ nằm trong
     // ảnh (BUG#47: "Không đọc được đoạn văn"), bỏ ảnh ở đó là hỏng thật.
     const audioCoversAllQuestions = apiQuestions.length > 1 && apiQuestions.every(q => q.isListening);
-    const skipScreenshot = isMultiTfExam || (isDonRacUrl && audioCoversAllQuestions);
+    // BUG#57 (live 18/11/2026): mọi đề đã đọc được JSON từ API game đều có text
+    // chính xác 100% trong prompt rồi. Chụp ảnh thêm vào chỉ để đặt hasImages=true
+    // ở service worker → Groq/cloudflare (text-only) bị loại → rơi vào Gemini dù
+    // đã có key Groq. Bỏ ảnh cho các dạng đó. Giữ ảnh riêng cho reading_tf: đoạn
+    // văn của dạng này chỉ nằm trong ảnh (BUG#47), bỏ là hỏng thật.
+    const skipScreenshot = isMultiTfExam
+      || (isDonRacUrl && audioCoversAllQuestions)
+      || (passageFromApi && examClass !== "reading_tf");
     const capturedImages = skipScreenshot ? [] : await captureSmartScreenshotsWithAutoScroll();
 
     const capturedBase64 = (audioData && audioData.base64) ? audioData.base64 : ((window.__LAST_CAPTURED_IOE_AUDIO__ && window.__LAST_CAPTURED_IOE_AUDIO__.base64) ? window.__LAST_CAPTURED_IOE_AUDIO__.base64 : null);
