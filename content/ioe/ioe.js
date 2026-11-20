@@ -893,6 +893,11 @@
       let ok = false;
       const r1 = await ioeBridgeRequest("CLICK_NAME", { name: answers[i] ? "btnTrue" : "btnFalse" }, 8000);
       if (r1 && r1.payload && r1.payload.ok) ok = true;
+      // BUG#58: game LTV (Cocos 3.8) dùng btn_true / btn_false.
+      if (!ok) {
+        const rn = await ioeBridgeRequest("CLICK_NAME", { name: answers[i] ? "btn_true" : "btn_false" }, 8000);
+        ok = !!(rn && rn.payload && rn.payload.ok);
+      }
       if (!ok) {
         const r2 = await ioeBridgeRequest("CLICK_TEXT", { text: answers[i] ? "True" : "False", contains: true }, 8000);
         ok = !!(r2 && r2.payload && r2.payload.ok);
@@ -2793,6 +2798,11 @@
       if (!(resp && resp.payload && resp.payload.ok)) {
         resp = await ioeBridgeRequest("CLICK_NAME", { name: isTrue ? "btnTrue" : "btnFalse" }, 8000);
       }
+      // BUG#58 (live 20/11/2026, game LTV / Cocos 3.8): nút TF tên btn_true /
+      // btn_false (snake_case) — btnTrue/btnFalse không tồn tại ở engine mới.
+      if (!(resp && resp.payload && resp.payload.ok)) {
+        resp = await ioeBridgeRequest("CLICK_NAME", { name: isTrue ? "btn_true" : "btn_false" }, 8000);
+      }
       if (resp && resp.payload && resp.payload.ok) {
         showToast(`✅ Cocos: đã chọn [${isTrue ? "True" : "False"}]!`);
         return true;
@@ -2950,6 +2960,11 @@
       let ok = !!(resp && resp.payload && resp.payload.ok);
       if (!ok) {
         resp = await ioeBridgeRequest("CLICK_NAME", { name: val ? "btnTrue" : "btnFalse" }, 8000);
+        ok = !!(resp && resp.payload && resp.payload.ok);
+      }
+      // BUG#58: game LTV (Cocos 3.8) dùng btn_true / btn_false.
+      if (!ok) {
+        resp = await ioeBridgeRequest("CLICK_NAME", { name: val ? "btn_true" : "btn_false" }, 8000);
         ok = !!(resp && resp.payload && resp.payload.ok);
       }
       if (ok) {
