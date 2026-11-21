@@ -274,7 +274,12 @@
     // the same audio URLs — a cache keyed on audio alone returns the OLD
     // attempt's word (wrong length for the new mask). Mix the pool in.
     const poolPart = (Array.isArray(pool) && pool.length) ? "|pool:" + pool.join(",").toLowerCase() : "";
-    if (q.audio) return "a:" + q.audio + "|m:" + (q.maskPrefix || "") + (q.maskStars || 0) + poolPart;
+    // BUG#59 (live 21/11/2026, game03 tai-tao-san-ho): IOE TÁI SỬ DỤNG cùng một
+    // file mp3 (kho audio game9) cho NHIỀU câu hỏi KHÁC NHAU qua các vòng/acc.
+    // Cache键 chỉ theo audio URL ⇒ câu "What did Jack steal?" ăn đáp án của câu
+    // khác có cùng file ⇒ 20-50/100 dù AI giải đúng. Luôn gồm prompt (đã chuẩn
+    // hoá) vào key, kể cả khi có audio.
+    if (q.audio) return "a:" + q.audio + "|p:" + qNorm(q.prompt) + "|m:" + (q.maskPrefix || "") + (q.maskStars || 0) + poolPart;
     return "p:" + qNorm(q.prompt) + "|o:" + (q.answers || []).map(qNorm).join("~") + poolPart;
   }
   async function getQCache() {
