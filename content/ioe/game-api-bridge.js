@@ -1570,6 +1570,14 @@
     //     solver không phát hiện được game đã chuyển câu (gốc BUG#24).
     const META_NODE = /^(lblName|lblID|lbLevel|lblScore|lblTimer|lblVersion)$/i;
     for (const l of labels) {
+      // BUG#60 (live 21/11/2026, don-rac-bai-bien / Cocos 3.8): counter là
+      // lbNumberStatus dạng "6/10" (không phải lblCurrent rời). Ưu tiên node này
+      // để waitForTfNextQuestion thấy câu đổi thật, không click dồn vào 1 câu.
+      if (/^(lbNumberStatus|lblCurrent)$/i.test(l.node || "")) {
+        const cm = String(l.text || "").match(/^(\d+)\s*\/\s*(\d+)$/);
+        if (cm) { out.qnum = parseInt(cm[1], 10); out.total = parseInt(cm[2], 10); continue; }
+        if (/^\d+$/.test(String(l.text || "").trim())) { out.qnum = parseInt(String(l.text).trim(), 10); continue; }
+      }
       if (l.node === "lblCurrent" && /^\d+$/.test(String(l.text || "").trim())) {
         out.qnum = parseInt(String(l.text).trim(), 10);
       } else if (/^(lbl_total_quest|lblTotalQuest|lbl_total|total_quest)$/i.test(l.node || "") && /^\d+$/.test(String(l.text || "").trim())) {
